@@ -24,7 +24,7 @@ import uuid
 from cosyvoice.utils.common import fade_in_out
 from cosyvoice.utils.file_utils import convert_onnx_to_trt, export_cosyvoice2_vllm
 from cosyvoice.utils.common import TrtContextWrapper
-
+from cosyvoice.tokenizer.tokenizer import get_qwen_tokenizer
 
 class CosyVoiceModel:
 
@@ -101,30 +101,130 @@ class CosyVoiceModel:
         return {'min_shape': min_shape, 'opt_shape': opt_shape, 'max_shape': max_shape, 'input_names': input_names}
 
     def llm_job(self, text, prompt_text, llm_prompt_speech_token, llm_embedding, uuid):
-        with self.llm_context, torch.cuda.amp.autocast(self.fp16 is True and hasattr(self.llm, 'vllm') is False):
+        """
+        LLM 단계에서 입력 텍스트(Generator or Tensor)를 받아 speech tokens을 생성하고,
+        세션(uuid) 별 딕셔너리에 누적 저장하면서 디버그 로그를 출력한다.
+        """
+
+        # -----------------------
+        # 입력 텍스트 정보 로그 (비스트리밍 모드일 때만)
+        # -----------------------
+        text_ids, raw_text = None, None
+        if not isinstance(text, Generator):
+            try:
+                text_ids = text.tolist()
+            except Exception:
+                text_ids = str(text)
+
+            # 텍스트 원본 디코딩 (QwenTokenizer 우선 사용)
+            try:
+                from cosyvoice.tokenizer.tokenizer import get_qwen_tokenizer
+                tok = get_qwen_tokenizer(
+                    token_path="pretrained_models/CosyVoice2-0.5B/CosyVoice-BlankEN",
+                    skip_special_tokens=True
+                )
+                if isinstance(text_ids, list) and len(text_ids) > 0 and isinstance(text_ids[0], list):
+                    raw_text = tok.decode(text_ids[0])
+                else:
+                    raw_text = tok.decode(text_ids)
+            except Exception as e:
+                raw_text = f"<decode error: {e}>"
+
+            print(f"[INPUT] uuid={uuid}")
+            print(f"   raw text   : {raw_text}")
+            print(f"   text_ids   : {text_ids}")
+
+        with self.llm_context, torch.cuda.amp.autocast(
+            self.fp16 is True and hasattr(self.llm, 'vllm') is False
+        ):
+
+            # ========================
+            # 1) 스트리밍 입력 모드
+            # ========================
             if isinstance(text, Generator):
-                assert isinstance(self, CosyVoice2Model) and not hasattr(self.llm, 'vllm'), 'streaming input text is only implemented for CosyVoice2 and do not support vllm!'
-                for i in self.llm.inference_bistream(text=text,
-                                                     prompt_text=prompt_text.to(self.device),
-                                                     prompt_text_len=torch.tensor([prompt_text.shape[1]], dtype=torch.int32).to(self.device),
-                                                     prompt_speech_token=llm_prompt_speech_token.to(self.device),
-                                                     prompt_speech_token_len=torch.tensor([llm_prompt_speech_token.shape[1]], dtype=torch.int32).to(self.device),
-                                                     embedding=llm_embedding.to(self.device)):
+                assert isinstance(self, CosyVoice2Model) and not hasattr(self.llm, 'vllm'), \
+                    'streaming input text is only implemented for CosyVoice2 and do not support vllm!'
+
+                for i in self.llm.inference_bistream(
+                    text=text,
+                    prompt_text=prompt_text.to(self.device),
+                    prompt_text_len=torch.tensor([prompt_text.shape[1]], dtype=torch.int32).to(self.device),
+                    prompt_speech_token=llm_prompt_speech_token.to(self.device),
+                    prompt_speech_token_len=torch.tensor([llm_prompt_speech_token.shape[1]], dtype=torch.int32).to(self.device),
+                    embedding=llm_embedding.to(self.device)
+                ):
                     self.tts_speech_token_dict[uuid].append(i)
+
+                    # 타입 안전 변환
+                    if isinstance(i, torch.Tensor):
+                        speech_tokens = i.cpu().tolist()
+                    elif isinstance(i, (list, tuple)):
+                        speech_tokens = list(i)
+                    else:
+                        speech_tokens = [int(i)]
+
+                    # print(
+                    #     f"[OUTPUT-bistream] uuid={uuid} "
+                    #     f"| speech_tokens={speech_tokens[:10]}... "
+                    #     f"(len={len(speech_tokens)})"
+                    # )
+
+            # ========================
+            # 2) 일반 입력 모드
+            # ========================
             else:
-                for i in self.llm.inference(text=text.to(self.device),
-                                            text_len=torch.tensor([text.shape[1]], dtype=torch.int32).to(self.device),
-                                            prompt_text=prompt_text.to(self.device),
-                                            prompt_text_len=torch.tensor([prompt_text.shape[1]], dtype=torch.int32).to(self.device),
-                                            prompt_speech_token=llm_prompt_speech_token.to(self.device),
-                                            prompt_speech_token_len=torch.tensor([llm_prompt_speech_token.shape[1]], dtype=torch.int32).to(self.device),
-                                            embedding=llm_embedding.to(self.device),
-                                            uuid=uuid):
+                for i in self.llm.inference(
+                    text=text.to(self.device),
+                    text_len=torch.tensor([text.shape[1]], dtype=torch.int32).to(self.device),
+                    prompt_text=prompt_text.to(self.device),
+                    prompt_text_len=torch.tensor([prompt_text.shape[1]], dtype=torch.int32).to(self.device),
+                    prompt_speech_token=llm_prompt_speech_token.to(self.device),
+                    prompt_speech_token_len=torch.tensor([llm_prompt_speech_token.shape[1]], dtype=torch.int32).to(self.device),
+                    embedding=llm_embedding.to(self.device),
+                    uuid=uuid
+                ):
                     self.tts_speech_token_dict[uuid].append(i)
+
+                    if isinstance(i, torch.Tensor):
+                        speech_tokens = i.cpu().tolist()
+                    elif isinstance(i, (list, tuple)):
+                        speech_tokens = list(i)
+                    else:
+                        speech_tokens = [int(i)]
+
+                    # print(f"[MAP] uuid={uuid}")
+                    # print(f"   raw text       : {raw_text}")
+                    # print(f"   text_ids       : {text_ids}")
+                    # print(f"   -> speech_tokens: {speech_tokens[:10]}... (len={len(speech_tokens)})")
+                    # print(f"   going-total={len(self.tts_speech_token_dict[uuid])}")
+
+                #  루프가 끝난 뒤 최종 누적 토큰 로그 추가
+                final_tokens = []
+                for tok in self.tts_speech_token_dict[uuid]:
+                    if isinstance(tok, torch.Tensor):
+                        final_tokens.extend(tok.cpu().tolist())
+                    elif isinstance(tok, (list, tuple)):
+                        final_tokens.extend(tok)
+                    else:
+                        final_tokens.append(int(tok))
+
+                print(f"[FINAL-MAP] uuid={uuid}")
+                print(f"   raw text       : {raw_text}")
+                print(f"   text_ids       : {text_ids}")
+                print(f"   -> all speech tokens ({len(final_tokens)}): {final_tokens}")
+
+        # ========================
+        # 3) LLM 종료 플래그
+        # ========================
         self.llm_end_dict[uuid] = True
+        print(
+            f"[LLM-END] uuid={uuid} | LLM finished "
+            f"| Total Speech Tokens={len(self.tts_speech_token_dict.get(uuid, []))}"
+        )
+
 
     def vc_job(self, source_speech_token, uuid):
-        self.tts_speech_token_dict[uuid] = source_speech_token.flatten().tolist()
+        self.tts_speech_token_dict[uuid] = source_speech_token.flatten().tolist() # 레퍼런스 음성 추출 
         self.llm_end_dict[uuid] = True
 
     def token2wav(self, token, prompt_token, prompt_feat, embedding, uuid, finalize=False, speed=1.0):
@@ -163,6 +263,9 @@ class CosyVoiceModel:
                 assert self.hift_cache_dict[uuid] is None, 'speed change only support non-stream inference mode'
                 tts_mel = F.interpolate(tts_mel, size=int(tts_mel.shape[2] / speed), mode='linear')
             tts_speech, tts_source = self.hift.inference(speech_feat=tts_mel, cache_source=hift_cache_source)
+
+            print(f"[HiFiGAN-FINAL] | token2wav uuid={uuid} | mel_len={tts_mel.shape[2]} | wav_len={tts_speech.shape[1]} | speed={speed}")
+
             if self.hift_cache_dict[uuid] is not None:
                 tts_speech = fade_in_out(tts_speech, self.hift_cache_dict[uuid]['speech'], self.speech_window)
         return tts_speech

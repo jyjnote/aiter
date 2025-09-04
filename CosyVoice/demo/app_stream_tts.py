@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
+#  CUDA_VISIBLE_DEVICES=4 python -u demo/app_stream_tts.py
 import os
 import sys
 import io
@@ -16,12 +16,13 @@ from typing import Dict, Optional, List
 
 import torch
 import torchaudio
-from flask import Flask, request, Response, render_template_string, jsonify
+# render_template과 render_template_string을 render_template으로 변경합니다.
+from flask import Flask, request, Response, render_template, jsonify
 
 # ==============================
 # 0) App & Model Init
 # ==============================
-THIS_DIR = os.path.dirname(os.path.abspath(__file__))        # .../CosyVoice/demo
+THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJ_DIR = os.path.dirname(THIS_DIR)
 
 sys.path.append(PROJ_DIR)
@@ -33,7 +34,7 @@ from cosyvoice.utils.file_utils import load_wav, logging
 app = Flask(__name__)
 
 MODEL_DIR = os.path.join(PROJ_DIR, "pretrained_models", "CosyVoice2-0.5B")
-PROMPT_WAV = os.path.join(PROJ_DIR, "asset", "zero_shot_prompt1.wav")
+PROMPT_WAV = os.path.join(PROJ_DIR, "asset", "zero_shot_prompt.wav")
 
 if not os.path.isdir(MODEL_DIR):
     raise FileNotFoundError(f"{MODEL_DIR} does not exist! (expected CosyVoice2-0.5B)")
@@ -49,17 +50,17 @@ SAMPLE_RATE = cosyvoice.sample_rate
 PUNCT = re.compile(r"[\.!\?…。\！？]")
 
 # ==============================
-# 1) 세션 관리
+# 1) 세션 관리 (변경 없음)
 # ==============================
 @dataclass
 class Session:
     sid: str
-    text: str = ""                     
-    last_flush_idx: int = 0            
+    text: str = ""
+    last_flush_idx: int = 0
     last_input_ts: float = field(default_factory=time.time)
-    last_flush_ts: float = field(default_factory=time.time)   
-    tts_q: queue.Queue = field(default_factory=queue.Queue)   
-    sse_q: queue.Queue = field(default_factory=queue.Queue)   
+    last_flush_ts: float = field(default_factory=time.time)
+    tts_q: queue.Queue = field(default_factory=queue.Queue)
+    sse_q: queue.Queue = field(default_factory=queue.Queue)
     worker_thread: Optional[threading.Thread] = None
     stop_event: threading.Event = field(default_factory=threading.Event)
 
@@ -70,6 +71,7 @@ FLUSH_INTERVAL_SEC = 1.0
 WORD_TIMEOUT_SEC   = 2.0
 KEEPALIVE_SEC      = 15.0
 
+# 사용자 스레드 활당 부분임
 def get_or_create_session(sid: str) -> Session:
     with SESS_LOCK:
         sess = SESSIONS.get(sid)
@@ -82,7 +84,7 @@ def get_or_create_session(sid: str) -> Session:
     return sess
 
 # ==============================
-# 2) 문장 추출 & 큐잉
+# 2) 문장 추출 & 큐잉 (변경 없음)
 # ==============================
 def enqueue_flushable_sentences(sess: Session, force: bool = False):
     new_segment = sess.text[sess.last_flush_idx:]
@@ -94,38 +96,46 @@ def enqueue_flushable_sentences(sess: Session, force: bool = False):
 
     for m in re.finditer(r"[^\.!\?…。\！？]*[\.!\?…。\！？]", new_segment):
         end = m.end()
-        chunk = new_segment[:end].strip()
+        chunk = new_segment[:end].strip() # 구두점 해당 부분까지 잘라서 청크로 저장하고
         if chunk:
-            sentences.append(chunk)
+            sentences.append(chunk) # 이부분에서 문장 리스트에 담아줌
         new_segment = new_segment[end:]
         consumed += end
 
-    sess.last_flush_idx += consumed
+    sess.last_flush_idx += consumed # 어디까지 소비했는지 그냥 체크하는 용도
 
-    if force:
+    if force: # force 강제로 현재 텍스트를 만들어줘야할 경우가 있음
+    # 공백 구두점, 사용자의 타임 아웃 이렇게 3가지 경우가 있음 이땐 바로 푸시해서 음성을 합성시키기 위함
+    # 167 line에 코드 나와있음.
         rest = new_segment.strip()
         if rest:
             sentences.append(rest)
             sess.last_flush_idx = len(sess.text)
 
-    for s in sentences:
+    for s in sentences: # 디버깅라인
         logging.debug(f"[{sess.sid}] enqueue sentence: {s[:80]}{'...' if len(s)>80 else ''}")
         sess.tts_q.put(s)
         sess.last_flush_ts = time.time()
 
 # ==============================
-# 3) TTS 워커
+# 3) TTS 워커 (변경 없음)
 # ==============================
+# tts_worker 메서드에서 이 메서드를 실행함
 def synth_sentence_to_wav_bytes(sentence: str) -> bytes:
-    wav_parts = []
-
-    # CosyVoice 내부 inference 호출
-    for out in cosyvoice.inference_zero_shot_typing(
+    # 이 함수는 변경할 필요 없음
+    # 합성 코드 라인
+    wav_parts = [] # 청크 단위로 만들어진 오디오를 붙여서 가지고 있음, 이를 사용
+    # 이 cosy 메서드를 불러와서 사용함.
+    # tts.model 메서드는 한/영 잘 나오는데 중간중간 bgm같은게 끼여져있음
+    # cosyvoice.inference_zero_shot은 한국어가 중국어 처럼 나옴
+    # cross 랭귀지가 bgm 문제가 젤 적은거 같음
+    # 음악에 해당하는 토큰ID를 한번 검사, 그리고 특정 단어에 대해 뒤에 음성에 튀어나오냐?
+    for out in cosyvoice.inference_zero_shot_typing( 
             text_stream=[sentence],
             prompt_text="<|endofprompt|>",
             prompt_speech_16k=prompt_speech_16k,
             zero_shot_spk_id="",
-            stream=False,   # 즉시합성
+            stream=False,
             speed=1.0,
             text_frontend=True,
             interleave_prompt_in_llm=False
@@ -139,22 +149,58 @@ def synth_sentence_to_wav_bytes(sentence: str) -> bytes:
     buf = io.BytesIO()
     torchaudio.save(buf, wav_cat, SAMPLE_RATE, format="wav")
     buf.seek(0)
-    return buf.read()
+    return buf.read() # 서버가 읽을 수 있게 리턴해주기
+    # for out in cosyvoice.inference_cross_lingual(
+    #         tts_text=sentence,
+    #         prompt_speech_16k=prompt_speech_16k,
+    #         zero_shot_spk_id="",
+    #         stream=False,
+    #         speed=1.0,
+    #         text_frontend=True
+    #     ):
+    #     wav_parts.append(out["tts_speech"].cpu())
+
+    # if not wav_parts:
+    #     return b""
+
+    # wav_cat = torch.cat(wav_parts, dim=1)
+    # buf = io.BytesIO()
+    # torchaudio.save(buf, wav_cat, SAMPLE_RATE, format="wav")
+    # buf.seek(0)
+    # return buf.read() # 서버가 읽을 수 있게 리턴해주기
 
 
 def tts_worker(sess: Session):
     last_keepalive = time.time()
+    
+    # 로그 추가: 워커 시작을 알림
+    print(f"[{sess.sid}] TTS worker started.")
 
     while not sess.stop_event.is_set():
         now = time.time()
 
         # --- 혼합 전략 ---
+        # 영어같은경우 she i/s my mam 일경우 i,s가 분단됨 이를 방지하고자 매우 작은 세컨드로 끝글자가 공백,구두점인지 판별 -> A
+        # 사용자가 마지막 입력이 멈췄을 경우 타이핑이 전부 끝났다고 판단 -> B
         if (now - sess.last_flush_ts) >= FLUSH_INTERVAL_SEC and sess.last_flush_idx < len(sess.text):
+            
+            # 로그 추가: 플러시 조건 확인 시작
+            print(f"[{sess.sid}] DEBUG: Checking flush conditions... (Full text: '{sess.text}')")
+            
             last_char = sess.text[-1] if sess.text else ""
+            
             if last_char.isspace() or PUNCT.match(last_char):
-                enqueue_flushable_sentences(sess, force=True)
+                # 로그 추가: 조건 A (공백/구두점) 충족
+                print(f"[{sess.sid}] DEBUG: Condition A MET: Flushing due to space/punct ('{last_char}').")
+                enqueue_flushable_sentences(sess, force=True) # 강제합성
             elif (now - sess.last_input_ts) >= WORD_TIMEOUT_SEC:
-                enqueue_flushable_sentences(sess, force=True)
+                # 로그 추가: 조건 B (타임아웃) 충족
+                print(f"[{sess.sid}] DEBUG: Condition B MET: Flushing due to typing timeout ({WORD_TIMEOUT_SEC}s).")
+                enqueue_flushable_sentences(sess, force=True) # 강제합성
+            else:
+                # 로그 추가: 대기 상태
+                print(f"[{sess.sid}] DEBUG: WAITING: Last char ('{last_char}') is not space/punct, and timeout not met.")
+
 
         try:
             sentence = sess.tts_q.get(timeout=0.1)
@@ -177,98 +223,16 @@ def tts_worker(sess: Session):
             last_keepalive = time.time()
 
     sess.sse_q.put(json.dumps({"type": "end"}))
-
+    
+    # 로그 추가: 워커 종료를 알림
+    print(f"[{sess.sid}] TTS worker stopped.")
 # ==============================
 # 4) HTTP Routes
 # ==============================
 @app.route("/")
 def index():
-    html = """
-<!doctype html>
-<html lang="ko">
-<head>
-  <meta charset="utf-8" />
-  <title>Streaming Text → TTS</title>
-  <style>
-    body {
-      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, 'Noto Sans KR', sans-serif;
-      line-height: 1.4;
-      padding: 24px;
-    }
-    textarea {
-      width: 100%;
-      height: 400px;        /* ✅ 크기 크게 */
-      font-size: 18px;      /* ✅ 글자 크게 */
-      padding: 12px;
-      border-radius: 8px;
-      border: 1px solid #ccc;
-      resize: vertical;     /* ✅ 세로 크기 조절 가능 */
-    }
-  </style>
-</head>
-<body>
-  <h1>Streaming Text → TTS (혼합 전략)</h1>
-  <textarea id="ta" placeholder="여기에 계속 타이핑 해보세요."></textarea>
-  <audio id="player" controls></audio>
-  <div id="log" style="white-space: pre-wrap;"></div>
-<script>
-(function() {
-  const sid = crypto.randomUUID();
-  const ta = document.getElementById('ta');
-  const log = document.getElementById('log');
-  const player = document.getElementById('player');
-
-  const q = [];
-  let playing = false;
-  function enqueueAndPlay(b64) {
-    const byteChars = atob(b64);
-    const byteNums = new Array(byteChars.length);
-    for (let i=0; i<byteChars.length; i++) byteNums[i] = byteChars.charCodeAt(i);
-    const blob = new Blob([new Uint8Array(byteNums)], {type: 'audio/wav'});
-    const url = URL.createObjectURL(blob);
-    q.push(url);
-    if (!playing) playNext();
-  }
-  function playNext() {
-    if (q.length === 0) { playing = false; return; }
-    playing = true;
-    const url = q.shift();
-    player.src = url;
-    player.play().catch(err => {
-      log.textContent += "\\n[AUDIO] play error: " + err;
-      playing = false;
-    });
-  }
-  player.onended = () => playNext();
-
-  const es = new EventSource("/sse_audio?sid=" + encodeURIComponent(sid));
-  es.onmessage = (e) => {
-    try {
-      const msg = JSON.parse(e.data);
-      if (msg.type === 'audio' && msg.b64wav) {
-        enqueueAndPlay(msg.b64wav);
-      }
-    } catch (err) {
-      log.textContent += "\\n[SSE] parse error: " + err;
-    }
-  };
-
-  function sendText(force=false) {
-    const text = ta.value;
-    fetch('/type', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ sid, text, force })
-    }).catch(()=>{});
-  }
-
-  ta.addEventListener('input', () => sendText(false));
-})();
-</script>
-</body>
-</html>
-    """
-    return render_template_string(html)
+    # HTML 문자열 대신 render_template 함수를 사용하여 파일을 렌더링합니다.
+    return render_template("index.html")
 
 @app.route("/type", methods=["POST"])
 def type_event():

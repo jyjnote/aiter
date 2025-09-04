@@ -177,31 +177,32 @@ class TransformerLM(torch.nn.Module):
             uuid: str = '',
     ) -> Generator[torch.Tensor, None, None]:
         device = text.device
-        text = torch.concat([prompt_text, text], dim=1)
-        text_len += prompt_text_len
-        text = self.text_embedding(text)
+        text = torch.concat([prompt_text, text], dim=1) # 프롬픝 텍스트와 원본 텍스트 컨캣네이션
+        text_len += prompt_text_len #  전체 길이 업데이트
+        text = self.text_embedding(text) # 텍스트 토큰 → 임베딩 벡터
 
         # 1. encode text
         text, text_len = self.encode(text, text_len)
 
         # 2. encode embedding
         if embedding.shape[0] != 0:
-            embedding = F.normalize(embedding, dim=1)
-            embedding = self.spk_embed_affine_layer(embedding)
-            embedding = embedding.unsqueeze(dim=1)
+            embedding = F.normalize(embedding, dim=1) # 정규화
+            embedding = self.spk_embed_affine_layer(embedding) # 차원 맞춤
+            embedding = embedding.unsqueeze(dim=1) # 배치 차원 추가
         else:
             embedding = torch.zeros(1, 0, self.llm_input_size, dtype=text.dtype).to(device).to(text.dtype)
 
         # 3. concat llm_input
-        sos_eos_emb = self.llm_embedding.weight[self.sos_eos].reshape(1, 1, -1)
-        task_id_emb = self.llm_embedding.weight[self.task_id].reshape(1, 1, -1)
-        if prompt_speech_token_len != 0:
-            prompt_speech_token_emb = self.speech_embedding(prompt_speech_token)
+        sos_eos_emb = self.llm_embedding.weight[self.sos_eos].reshape(1, 1, -1) # 시작 토큰
+        task_id_emb = self.llm_embedding.weight[self.task_id].reshape(1, 1, -1) # 태스크 구분 (TTS용)
+        if prompt_speech_token_len != 0: # 넣을게 있을 때
+            prompt_speech_token_emb = self.speech_embedding(prompt_speech_token) # 프롬프트 음성 토큰
         else:
             prompt_speech_token_emb = torch.zeros(1, 0, self.llm_input_size, dtype=text.dtype).to(device)
-        lm_input = torch.concat([sos_eos_emb, embedding, text, task_id_emb, prompt_speech_token_emb], dim=1)
+        # [SOS | 화자임베딩 | 텍스트 | 태스크ID | 프롬프트 음성토큰] 형태 이게 autoregressive LLM에 들어감.
+        lm_input = torch.concat([sos_eos_emb, embedding, text, task_id_emb, prompt_speech_token_emb], dim=1) 
 
-        # 4. cal min/max_length
+        # 4. cal min/max_length 텍스트 길이 대비 음성 토큰 길이를 최소 2배, 최대 20배로 제한.
         min_len = int((text_len - prompt_text_len) * min_token_text_ratio)
         max_len = int((text_len - prompt_text_len) * max_token_text_ratio)
 
@@ -218,6 +219,8 @@ class TransformerLM(torch.nn.Module):
             # force continue decode first token
             if i == 0:
                 logp[:, self.speech_token_size] = -float('inf')
+                # 샘플링 정책(sampling_ids)에 따라 다음 토큰 결정
+                # EOS가 나오면 종료
             top_ids = self.sampling_ids(logp.squeeze(dim=0), out_tokens, sampling, ignore_eos=True if i < min_len else False).item()
             if top_ids == self.speech_token_size:
                 break
@@ -225,6 +228,8 @@ class TransformerLM(torch.nn.Module):
             yield top_ids
             out_tokens.append(top_ids)
             offset += lm_input.size(1)
+            # 방금 생성한 speech token을 임베딩해 다시 LLM 입력에 추가
+            # autoregressive 방식으로 다음 토큰 예측
             lm_input = self.speech_embedding.weight[top_ids].reshape(1, 1, -1)
 
 
