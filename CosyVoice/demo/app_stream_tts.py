@@ -16,7 +16,6 @@ from typing import Dict, Optional, List
 
 import torch
 import torchaudio
-# render_template과 render_template_string을 render_template으로 변경합니다.
 from flask import Flask, request, Response, render_template, jsonify
 
 # ==============================
@@ -34,7 +33,7 @@ from cosyvoice.utils.file_utils import load_wav, logging
 app = Flask(__name__)
 
 MODEL_DIR = os.path.join(PROJ_DIR, "pretrained_models", "CosyVoice2-0.5B")
-PROMPT_WAV = os.path.join(PROJ_DIR, "asset", "zero_shot_prompt.wav")
+PROMPT_WAV = os.path.join(PROJ_DIR, "asset", "zero_shot_prompt1.wav")
 
 if not os.path.isdir(MODEL_DIR):
     raise FileNotFoundError(f"{MODEL_DIR} does not exist! (expected CosyVoice2-0.5B)")
@@ -47,10 +46,18 @@ prompt_speech_16k = load_wav(PROMPT_WAV, 16000)
 print("모델 로드 완료.")
 
 SAMPLE_RATE = cosyvoice.sample_rate
-PUNCT = re.compile(r"[\.!\?…。\！？]")
 
 # ==============================
-# 1) 세션 관리 (변경 없음)
+# Helper Functions
+# ==============================
+def is_korean(char: str) -> bool:
+    """주어진 문자가 한글 범위(가-힣)에 있는지 확인합니다."""
+    if not char:
+        return False
+    return '\uac00' <= char <= '\ud7a3'
+
+# ==============================
+# 1) Session Management
 # ==============================
 @dataclass
 class Session:
@@ -67,11 +74,9 @@ class Session:
 SESSIONS: Dict[str, Session] = {}
 SESS_LOCK = threading.Lock()
 
-FLUSH_INTERVAL_SEC = 1.0
-WORD_TIMEOUT_SEC   = 2.0
+FLUSH_INTERVAL_SEC = 0.5
 KEEPALIVE_SEC      = 15.0
 
-# 사용자 스레드 활당 부분임
 def get_or_create_session(sid: str) -> Session:
     with SESS_LOCK:
         sess = SESSIONS.get(sid)
@@ -84,7 +89,7 @@ def get_or_create_session(sid: str) -> Session:
     return sess
 
 # ==============================
-# 2) 문장 추출 & 큐잉 (변경 없음)
+# 2) Sentence Extraction & Queuing
 # ==============================
 def enqueue_flushable_sentences(sess: Session, force: bool = False):
     new_segment = sess.text[sess.last_flush_idx:]
@@ -93,46 +98,56 @@ def enqueue_flushable_sentences(sess: Session, force: bool = False):
 
     consumed = 0
     sentences: List[str] = []
+    
+    sentence_re = re.compile(r"[^\.!\?…。\！？,;:]*[\.!\?…。\！？,;:]")
 
-    for m in re.finditer(r"[^\.!\?…。\！？]*[\.!\?…。\！？]", new_segment):
+    for m in sentence_re.finditer(new_segment):
         end = m.end()
-        chunk = new_segment[:end].strip() # 구두점 해당 부분까지 잘라서 청크로 저장하고
+        chunk = new_segment[:end].strip()
         if chunk:
-            sentences.append(chunk) # 이부분에서 문장 리스트에 담아줌
+            sentences.append(chunk)
         new_segment = new_segment[end:]
         consumed += end
 
-    sess.last_flush_idx += consumed # 어디까지 소비했는지 그냥 체크하는 용도
+    sess.last_flush_idx += consumed
 
-    if force: # force 강제로 현재 텍스트를 만들어줘야할 경우가 있음
-    # 공백 구두점, 사용자의 타임 아웃 이렇게 3가지 경우가 있음 이땐 바로 푸시해서 음성을 합성시키기 위함
-    # 167 line에 코드 나와있음.
+    if force:
         rest = new_segment.strip()
         if rest:
             sentences.append(rest)
-            sess.last_flush_idx = len(sess.text)
+        sess.last_flush_idx = len(sess.text)
 
-    for s in sentences: # 디버깅라인
+    for s in sentences:
         logging.debug(f"[{sess.sid}] enqueue sentence: {s[:80]}{'...' if len(s)>80 else ''}")
         sess.tts_q.put(s)
         sess.last_flush_ts = time.time()
 
 # ==============================
-# 3) TTS 워커 (변경 없음)
+# 3) TTS Worker & Synthesizer
 # ==============================
-# tts_worker 메서드에서 이 메서드를 실행함
+# <--- 수정: 언어 태그를 사용하는 최종 버전 ---
 def synth_sentence_to_wav_bytes(sentence: str) -> bytes:
-    # 이 함수는 변경할 필요 없음
-    # 합성 코드 라인
-    wav_parts = [] # 청크 단위로 만들어진 오디오를 붙여서 가지고 있음, 이를 사용
-    # 이 cosy 메서드를 불러와서 사용함.
-    # tts.model 메서드는 한/영 잘 나오는데 중간중간 bgm같은게 끼여져있음
-    # cosyvoice.inference_zero_shot은 한국어가 중국어 처럼 나옴
-    # cross 랭귀지가 bgm 문제가 젤 적은거 같음
-    # 음악에 해당하는 토큰ID를 한번 검사, 그리고 특정 단어에 대해 뒤에 음성에 튀어나오냐?
-    for out in cosyvoice.inference_zero_shot_typing( 
-            text_stream=[sentence],
-            prompt_text="<|endofprompt|>",
+    # 1. 언어 감지 및 태그 부착
+    first_char = sentence.lstrip()[:1]
+    is_ko = is_korean(first_char)
+
+    if is_ko:
+        tagged_sentence = f"<|ko|>{sentence}"
+        print(f"[TTS Worker] DEBUG: Korean detected. Applying <|ko|> tag.")
+    else:
+        tagged_sentence = f"<|en|>{sentence}"
+        print(f"[TTS Worker] DEBUG: English/Other detected. Applying <|en|> tag.")
+
+    wav_parts = []
+
+    # 2. 제너레이터를 통해 문장 전달
+    def text_generator():
+        yield ("RESET", tagged_sentence)
+
+    # 3. GitHub 이슈에서 권장하는 방식으로 TTS 호출
+    for out in cosyvoice.inference_zero_shot_typing(
+            text_stream=text_generator(),
+            prompt_text="", 
             prompt_speech_16k=prompt_speech_16k,
             zero_shot_spk_id="",
             stream=False,
@@ -149,58 +164,62 @@ def synth_sentence_to_wav_bytes(sentence: str) -> bytes:
     buf = io.BytesIO()
     torchaudio.save(buf, wav_cat, SAMPLE_RATE, format="wav")
     buf.seek(0)
-    return buf.read() # 서버가 읽을 수 있게 리턴해주기
-    # for out in cosyvoice.inference_cross_lingual(
-    #         tts_text=sentence,
-    #         prompt_speech_16k=prompt_speech_16k,
-    #         zero_shot_spk_id="",
-    #         stream=False,
-    #         speed=1.0,
-    #         text_frontend=True
-    #     ):
-    #     wav_parts.append(out["tts_speech"].cpu())
-
-    # if not wav_parts:
-    #     return b""
-
-    # wav_cat = torch.cat(wav_parts, dim=1)
-    # buf = io.BytesIO()
-    # torchaudio.save(buf, wav_cat, SAMPLE_RATE, format="wav")
-    # buf.seek(0)
-    # return buf.read() # 서버가 읽을 수 있게 리턴해주기
+    return buf.read()
 
 
+# <--- 수정: 지능형 타임아웃 로직이 적용된 최종 버전 ---
 def tts_worker(sess: Session):
     last_keepalive = time.time()
     
-    # 로그 추가: 워커 시작을 알림
     print(f"[{sess.sid}] TTS worker started.")
+
+    ENGLISH_FAST_TIMEOUT_SEC = 0.8
+    ENGLISH_SLOW_TIMEOUT_SEC = 2.0
+    KOREAN_TIMEOUT_SEC = 2.0
+    
+    FLUSH_PUNCT = re.compile(r"[\.!\?…。\！？,;:]")
 
     while not sess.stop_event.is_set():
         now = time.time()
 
-        # --- 혼합 전략 ---
-        # 영어같은경우 she i/s my mam 일경우 i,s가 분단됨 이를 방지하고자 매우 작은 세컨드로 끝글자가 공백,구두점인지 판별 -> A
-        # 사용자가 마지막 입력이 멈췄을 경우 타이핑이 전부 끝났다고 판단 -> B
         if (now - sess.last_flush_ts) >= FLUSH_INTERVAL_SEC and sess.last_flush_idx < len(sess.text):
             
-            # 로그 추가: 플러시 조건 확인 시작
-            print(f"[{sess.sid}] DEBUG: Checking flush conditions... (Full text: '{sess.text}')")
-            
-            last_char = sess.text[-1] if sess.text else ""
-            
-            if last_char.isspace() or PUNCT.match(last_char):
-                # 로그 추가: 조건 A (공백/구두점) 충족
-                print(f"[{sess.sid}] DEBUG: Condition A MET: Flushing due to space/punct ('{last_char}').")
-                enqueue_flushable_sentences(sess, force=True) # 강제합성
-            elif (now - sess.last_input_ts) >= WORD_TIMEOUT_SEC:
-                # 로그 추가: 조건 B (타임아웃) 충족
-                print(f"[{sess.sid}] DEBUG: Condition B MET: Flushing due to typing timeout ({WORD_TIMEOUT_SEC}s).")
-                enqueue_flushable_sentences(sess, force=True) # 강제합성
-            else:
-                # 로그 추가: 대기 상태
-                print(f"[{sess.sid}] DEBUG: WAITING: Last char ('{last_char}') is not space/punct, and timeout not met.")
+            last_real_char = sess.text.rstrip()[-1:] if sess.text.rstrip() else ""
+            is_ko_mode = is_korean(last_real_char)
 
+            should_flush = False
+            flush_reason = ""
+            
+            last_char = sess.text[-1:] if sess.text else ""
+
+            if is_ko_mode:
+                if FLUSH_PUNCT.match(last_char):
+                    should_flush = True
+                    flush_reason = f"Korean Punctuation ('{last_char}')"
+                elif last_char.isspace():
+                    should_flush = True
+                    flush_reason = "Korean Space"
+                elif (now - sess.last_input_ts) >= KOREAN_TIMEOUT_SEC:
+                    should_flush = True
+                    flush_reason = f"Korean Timeout ({KOREAN_TIMEOUT_SEC}s)"
+            else:
+                flush_on_punct = FLUSH_PUNCT.match(last_char)
+                flush_on_fast_timeout = last_char.isspace() and (now - sess.last_input_ts) >= ENGLISH_FAST_TIMEOUT_SEC
+                flush_on_slow_timeout = (now - sess.last_input_ts) >= ENGLISH_SLOW_TIMEOUT_SEC and sess.text[sess.last_flush_idx:].strip()
+                
+                if flush_on_punct:
+                    should_flush = True
+                    flush_reason = f"English Punctuation ('{last_char}')"
+                elif flush_on_fast_timeout:
+                    should_flush = True
+                    flush_reason = f"English Fast Timeout after space ({ENGLISH_FAST_TIMEOUT_SEC}s)"
+                elif flush_on_slow_timeout:
+                    should_flush = True
+                    flush_reason = f"English Slow Fallback Timeout ({ENGLISH_SLOW_TIMEOUT_SEC}s)"
+
+            if should_flush:
+                print(f"[{sess.sid}] DEBUG: Flushing triggered by: {flush_reason}.")
+                enqueue_flushable_sentences(sess, force=True)
 
         try:
             sentence = sess.tts_q.get(timeout=0.1)
@@ -216,6 +235,7 @@ def tts_worker(sess: Session):
                 else:
                     sess.sse_q.put(json.dumps({"type": "log", "msg": "empty audio"}))
             except Exception as e:
+                logging.error(f"TTS Error: {e}", exc_info=True)
                 sess.sse_q.put(json.dumps({"type": "log", "msg": f"TTS error: {e}"}))
 
         if (time.time() - last_keepalive) >= KEEPALIVE_SEC:
@@ -224,14 +244,13 @@ def tts_worker(sess: Session):
 
     sess.sse_q.put(json.dumps({"type": "end"}))
     
-    # 로그 추가: 워커 종료를 알림
     print(f"[{sess.sid}] TTS worker stopped.")
+
 # ==============================
 # 4) HTTP Routes
 # ==============================
 @app.route("/")
 def index():
-    # HTML 문자열 대신 render_template 함수를 사용하여 파일을 렌더링합니다.
     return render_template("index.html")
 
 @app.route("/type", methods=["POST"])
