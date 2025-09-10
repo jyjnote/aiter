@@ -23,12 +23,13 @@ import torchaudio.compliance.kaldi as kaldi
 import torchaudio
 import os
 import re
+import logging
 import inflect # "123" → "one hundred twenty three" 와 같은 곳에 사용됨
 try:
     import ttsfrd
     use_ttsfrd = True
 except ImportError:
-    print("failed to import ttsfrd, use wetext instead")
+    logging.info("failed to import ttsfrd, use wetext instead")
     from wetext import Normalizer as ZhNormalizer
     from wetext import Normalizer as EnNormalizer
     use_ttsfrd = False
@@ -55,20 +56,20 @@ class CosyVoiceFrontEnd:
         ## Camp+ 화자 임베딩 모델
         # ONNX Runtime 세션 객체, 화자 임베딩(Speaker Embedding) 모델 이름
         self.campplus_session = onnxruntime.InferenceSession(campplus_model, sess_options=option, providers=["CPUExecutionProvider"])
-        print(f"[Frontend-INFO] Loaded Camp+ speaker embedding model: {campplus_model}")
+        logging.info(f"[Frontend-INFO] Loaded Camp+ speaker embedding model: {campplus_model}")
 
         self.speech_tokenizer_session = onnxruntime.InferenceSession(speech_tokenizer_model, sess_options=option,
                                                                      providers=["CUDAExecutionProvider" if torch.cuda.is_available() else
                                                                                 "CPUExecutionProvider"])
 
-        print(f"[Frontend-INFO] Loaded Speech tokenizer model: {speech_tokenizer_model}")
+        logging.info(f"[Frontend-INFO] Loaded Speech tokenizer model: {speech_tokenizer_model}")
 
         if os.path.exists(spk2info):
             self.spk2info = torch.load(spk2info, map_location=self.device)
-            print(f"[Frontend-INFO] Loaded speaker info from {spk2info}")
+            logging.info(f"[Frontend-INFO] Loaded speaker info from {spk2info}")
         else:
             self.spk2info = {}
-            print(f"[Frontend-INFO] No speaker info file found, using empty dict")
+            logging.info(f"[Frontend-INFO] No speaker info file found, using empty dict")
 
         self.allowed_special = allowed_special
         self.use_ttsfrd = use_ttsfrd
@@ -78,13 +79,13 @@ class CosyVoiceFrontEnd:
             assert self.frd.initialize('{}/../../pretrained_models/CosyVoice-ttsfrd/resource'.format(ROOT_DIR)) is True, \
                 'failed to initialize ttsfrd resource'
             self.frd.set_lang_type('pinyinvg')
-            print(f"[Frontend-INFO] Using TTSFRD text normalizer (pinyinvg mode)")
+            logging.info(f"[Frontend-INFO] Using TTSFRD text normalizer (pinyinvg mode)")
 
         else:
             self.zh_tn_model = ZhNormalizer(remove_erhua=False)
             self.en_tn_model = EnNormalizer()
             self.inflect_parser = inflect.engine() # 영어 숫자 → 철자 변환 등 ("123" → "one hundred twenty three").
-            print(f"[Frontend-INFO] Using WeText normalizer (ZhNormalizer + EnNormalizer)")
+            logging.info(f"[Frontend-INFO] Using WeText normalizer (ZhNormalizer + EnNormalizer)")
 
     def _extract_text_token(self, text): # 텍스트를 토크나이즈해서 모델 입력용 텐서로 만드는 함수
         if isinstance(text, Generator):
@@ -93,15 +94,15 @@ class CosyVoiceFrontEnd:
             return self._extract_text_token_generator(text), torch.tensor([0], dtype=torch.int32).to(self.device)
         else:
             text_token = self.tokenizer.encode(text, allowed_special=self.allowed_special)
-            print(f"[BPE-DEBUG | _extract_text_token] input='{text}'")
-            print(f"[BPE-DEBUG | _extract_text_token] ids={text_token}")
+            logging.info(f"[BPE-DEBUG | _extract_text_token] input='{text}'")
+            logging.info(f"[BPE-DEBUG | _extract_text_token] ids={text_token}")
 
             try:
                 # HuggingFace 기반 토크나이저면 이렇게 원래 subword 단위로 변환 시도
                 tokens = self.tokenizer.tokenizer.convert_ids_to_tokens(text_token)
-                print(f"[BPE-DEBUG | _extract_text_token] tokens={tokens}")
+                logging.info(f"[BPE-DEBUG | _extract_text_token] BPE tokens={tokens}")
             except Exception as e:
-                print(f"[BPE-DEBUG | _extract_text_token] (convert_ids_to_tokens not available: {e})")
+                logging.info(f"[BPE-DEBUG | _extract_text_token] (convert_ids_to_tokens not available: {e})")
 
             text_token = torch.tensor([text_token], dtype=torch.int32).to(self.device)
             text_token_len = torch.tensor([text_token.shape[1]], dtype=torch.int32).to(self.device)
@@ -126,7 +127,7 @@ class CosyVoiceFrontEnd:
         speech_token = torch.tensor([speech_token], dtype=torch.int32).to(self.device)
         speech_token_len = torch.tensor([speech_token.shape[1]], dtype=torch.int32).to(self.device)
         
-        print(f"[BPE-DEBUG | _extract_speech_token] (speech_token->{speech_token[...,:10]} speech_token_len:->{speech_token_len})")
+        logging.info(f"[BPE-DEBUG | _extract_speech_token] (speech_token->{speech_token[...,:10]} speech_token_len:->{speech_token_len})")
 
         return speech_token, speech_token_len
     
@@ -140,9 +141,9 @@ class CosyVoiceFrontEnd:
         embedding = self.campplus_session.run(None,
                                               {self.campplus_session.get_inputs()[0].name: feat.unsqueeze(dim=0).cpu().numpy()})[0].flatten().tolist()
         embedding = torch.tensor([embedding]).to(self.device)
-        print(f"[SPK-EMBED-DEBUG] speech shape={speech.shape}")
-        print(f"[SPK-EMBED-DEBUG] fbank feat shape={feat.shape}")
-        print(f"[SPK-EMBED-DEBUG] embedding dim={embedding.shape} | first 5 vals={embedding[0, :5].tolist()}")
+        logging.info(f"[SPK-EMBED-DEBUG] speech shape={speech.shape}")
+        logging.info(f"[SPK-EMBED-DEBUG] fbank feat shape={feat.shape}")
+        logging.info(f"[SPK-EMBED-DEBUG] embedding dim={embedding.shape} | first 5 vals={embedding[0, :5].tolist()}")
 
         return embedding
 

@@ -172,7 +172,7 @@ class TransformerLM(torch.nn.Module):
             prompt_speech_token_len: torch.Tensor,
             embedding: torch.Tensor,
             sampling: int = 25,
-            max_token_text_ratio: float = 20,
+            max_token_text_ratio: float = 20, # 의심이 됨.
             min_token_text_ratio: float = 2,
             uuid: str = '',
     ) -> Generator[torch.Tensor, None, None]:
@@ -439,11 +439,16 @@ class Qwen2LM(TransformerLM):
             prompt_speech_token: torch.Tensor,
             prompt_speech_token_len: torch.Tensor,
             embedding: torch.Tensor,
-            sampling: int = 25,
-            max_token_text_ratio: float = 20,
-            min_token_text_ratio: float = 2,
+            sampling: int = 1,
+            max_token_text_ratio: float = 15,
+            min_token_text_ratio: float = 5,
             uuid: str = '',
     ) -> Generator[torch.Tensor, None, None]:
+        
+        logging.info(f"[PARAM CHECK] Qwen2LM.inference received sampling = {sampling} | inference")
+        logging.info(f"[PARAM CHECK] Qwen2LM.inference received max_token_text_ratio = {max_token_text_ratio} | inference")
+        logging.info(f"[PARAM CHECK] Qwen2LM.inference received min_token_text_ratio = {min_token_text_ratio} | inference")
+
         device = text.device
         text = torch.concat([prompt_text, text], dim=1)
         text_len += prompt_text_len
@@ -506,6 +511,17 @@ class Qwen2LM(TransformerLM):
                                                           cache=cache)
                 logp = self.llm_decoder(y_pred[:, -1]).log_softmax(dim=-1)
                 top_ids = self.sampling_ids(logp.squeeze(dim=0), out_tokens, sampling, ignore_eos=True if i < min_len else False).item()
+                
+                top_k_logp, top_k_indices = torch.topk(logp, k=5, dim=-1)
+                log_probs_str = ", ".join([f"{idx.item()}:{lp.item():.2f}" for idx, lp in zip(top_k_indices.squeeze(), top_k_logp.squeeze())])
+                
+                logging.info(
+                    f"[SAMPLING-DEBUG] step={i}, "
+                    f"selected_token={top_ids}, "
+                    f"top_5_candidates=[{log_probs_str}]"
+                )
+                # ✨
+                
                 if top_ids == self.speech_token_size:
                     break
                 if top_ids > self.speech_token_size:
@@ -524,11 +540,13 @@ class Qwen2LM(TransformerLM):
             prompt_speech_token: torch.Tensor,
             prompt_speech_token_len: torch.Tensor,
             embedding: torch.Tensor,
-            sampling: int = 25,
+            sampling: int = 1,
             max_token_text_ratio: float = 20,
             min_token_text_ratio: float = 2,
     ) -> Generator[torch.Tensor, None, None]:
-
+        
+        logging.info(f"[PARAM CHECK] Qwen2LM.inference received sampling = {sampling} | inference_bistream")
+        
         device = prompt_text.device
         # 1. prepare input
         sos_eos_emb = self.llm_embedding.weight[self.sos_eos].reshape(1, 1, -1)

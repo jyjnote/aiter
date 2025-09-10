@@ -193,41 +193,41 @@ class CosyVoice2(CosyVoice):
                 yield model_output
                 start_time = time.time()
 
-    def inference_zero_shot_typing(
-            self,
-            text_stream,
-            prompt_text: str,
-            prompt_speech_16k,
-            zero_shot_spk_id: str = "",
-            stream: bool = True,
-            speed: float = 1.0,
-            text_frontend: bool = True,
-            interleave_prompt_in_llm: bool = False,
-            **kwargs
-        ):
-        from cosyvoice.utils.file_utils import logging
+    # def inference_zero_shot_typing(
+    #         self,
+    #         text_stream,
+    #         prompt_text: str,
+    #         prompt_speech_16k,
+    #         zero_shot_spk_id: str = "",
+    #         stream: bool = True,
+    #         speed: float = 1.0,
+    #         text_frontend: bool = True,
+    #         interleave_prompt_in_llm: bool = False,
+    #         **kwargs
+    #     ):
+    #     from cosyvoice.utils.file_utils import logging
 
-        try:
-            signal, text = next(text_stream)
-            if signal != "RESET":
-                logging.warning(f"Expected ('RESET', text) format in text_stream, but got signal '{signal}'")
-                return
-        except StopIteration:
-            return
+    #     try:
+    #         signal, text = next(text_stream)
+    #         if signal != "RESET":
+    #             logging.warning(f"Expected ('RESET', text) format in text_stream, but got signal '{signal}'")
+    #             return
+    #     except StopIteration:
+    #         return
 
-        tagged_sentence = text
-        logging.info(f"[TTS] Synthesizing with language tag: {tagged_sentence[:50]}...")
+    #     tagged_sentence = text
+    #     logging.info(f"[TTS] Synthesizing with language tag: {tagged_sentence[:50]}...")
         
-        try:
-            for out in self.inference_cross_lingual(
-                    tts_text=tagged_sentence,
-                    prompt_speech_16k=prompt_speech_16k,
-                    zero_shot_spk_id=zero_shot_spk_id,
-                    stream=False,
-                    speed=speed,
-                    text_frontend=text_frontend,
-                    **kwargs
-                ):
-                yield out
-        except Exception as e:
-            logging.error("[TTS] Synthesis failed: %s", e, exc_info=True)
+    #     try:
+    #         for out in self.inference_cross_lingual(
+    #                 tts_text=tagged_sentence,
+    #                 prompt_speech_16k=prompt_speech_16k,
+    #                 zero_shot_spk_id=zero_shot_spk_id,
+    #                 stream=False,
+    #                 speed=speed,
+    #                 text_frontend=text_frontend,
+    #                 **kwargs
+    #             ):
+    #             yield out
+    #     except Exception as e:
+    #         logging.error("[TTS] Synthesis failed: %s", e, exc_info=True)

@@ -12,12 +12,14 @@ import queue
 import threading
 import uuid
 from dataclasses import dataclass, field
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Generator
 
 import torch
 import torchaudio
 from flask import Flask, request, Response, render_template, jsonify
 
+import random
+import numpy as np
 # ==============================
 # 0) App & Model Init
 # ==============================
@@ -29,6 +31,19 @@ sys.path.append(os.path.join(PROJ_DIR, "third_party", "Matcha-TTS"))
 
 from cosyvoice.cli.cosyvoice import CosyVoice2
 from cosyvoice.utils.file_utils import load_wav, logging
+
+# --- 강력한 로깅 설정 (기존 basicConfig 대체) ---
+# 모든 기존 로거의 핸들러를 제거 (Flask/werkzeug의 기본 핸들러 포함)
+for handler in logging.root.handlers[:]:
+    logging.root.removeHandler(handler)
+
+# 여기에 우리의 설정을 다시 적용 (stream=sys.stdout 추가)
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    stream=sys.stdout
+)
+# --- 설정 끝 ---
 
 app = Flask(__name__)
 
@@ -56,6 +71,33 @@ def is_korean(char: str) -> bool:
         return False
     return '\uac00' <= char <= '\ud7a3'
 
+def denoise_audio_chunk(wav_bytes: bytes, sample_rate: int) -> bytes:
+    """
+    오디오 청크(bytes)에서 저주파 노이즈(럼블)를 제거합니다.
+    """
+    if not wav_bytes:
+        return wav_bytes
+
+    try:
+        # 1. Bytes -> Tensor 변환
+        buf = io.BytesIO(wav_bytes)
+        waveform, sr = torchaudio.load(buf)
+
+        # 2. 저주파 노이즈 제거를 위한 High-pass 필터 적용
+        # 80Hz 이하의 소리(웅웅거리는 배경음, 마이크 럼블 등)를 줄입니다.
+        cutoff_freq = 80
+        enhanced_waveform = torchaudio.functional.highpass_biquad(waveform, sample_rate, cutoff_freq)
+
+        # 3. Tensor -> Bytes 변환
+        out_buf = io.BytesIO()
+        torchaudio.save(out_buf, enhanced_waveform, sample_rate, format="wav")
+        out_buf.seek(0)
+        return out_buf.read()
+    except Exception as e:
+        # 오디오 처리 중 오류 발생 시 원본을 그대로 반환
+        logging.error(f"Denoising error: {e}")
+        return wav_bytes
+
 # ==============================
 # 1) Session Management
 # ==============================
@@ -73,9 +115,7 @@ class Session:
 
 SESSIONS: Dict[str, Session] = {}
 SESS_LOCK = threading.Lock()
-
-FLUSH_INTERVAL_SEC = 0.5
-KEEPALIVE_SEC      = 15.0
+KEEPALIVE_SEC = 15.0
 
 def get_or_create_session(sid: str) -> Session:
     with SESS_LOCK:
@@ -114,112 +154,83 @@ def enqueue_flushable_sentences(sess: Session, force: bool = False):
     if force:
         rest = new_segment.strip()
         if rest:
+            punctuation = ".!?…。！？,;:"
+            if not rest.endswith(tuple(punctuation)):
+                rest += "."
             sentences.append(rest)
         sess.last_flush_idx = len(sess.text)
 
-    for s in sentences:
-        logging.debug(f"[{sess.sid}] enqueue sentence: {s[:80]}{'...' if len(s)>80 else ''}")
-        sess.tts_q.put(s)
+    if sentences:
         sess.last_flush_ts = time.time()
+        for s in sentences:
+            logging.debug(f"[{sess.sid}] enqueue sentence: {s[:80]}{'...' if len(s)>80 else ''}")
+            sess.tts_q.put(s)
 
 # ==============================
 # 3) TTS Worker & Synthesizer
 # ==============================
-# <--- 수정: 언어 태그를 사용하는 최종 버전 ---
-def synth_sentence_to_wav_bytes(sentence: str) -> bytes:
-    # 1. 언어 감지 및 태그 부착
-    first_char = sentence.lstrip()[:1]
+def stream_sentence_to_wav_chunks(sentence: str) -> Generator[bytes, None, None]:
+    """한 문장을 받아 오디오 청크(chunk)들을 스트리밍으로 반환하는 제너레이터"""
+
+    SEED = 1986
+    random.seed(SEED)
+    np.random.seed(SEED)
+    torch.manual_seed(SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(SEED)
+    logging.info(f"Random seeds fixed to {SEED}")
+
+
+    final_sentence = sentence.strip()
+
+    first_char = final_sentence.lstrip()[:1]
     is_ko = is_korean(first_char)
 
+    instruction = ""
     if is_ko:
-        tagged_sentence = f"<|ko|>{sentence}"
-        print(f"[TTS Worker] DEBUG: Korean detected. Applying <|ko|> tag.")
+        tagged_sentence = f"<|ko|>{final_sentence}"
+        instruction = "Please pronounce it clearly and articulately in Korean."
     else:
-        tagged_sentence = f"<|en|>{sentence}"
-        print(f"[TTS Worker] DEBUG: English/Other detected. Applying <|en|> tag.")
+        tagged_sentence = f"<|en|>{final_sentence}"
+        instruction = "Please pronounce it clearly and articulately in English."
 
-    wav_parts = []
+    try:
+        for out in cosyvoice.inference_instruct2(
+                tts_text=tagged_sentence,
+                instruct_text=instruction,
+                prompt_speech_16k=prompt_speech_16k,
+                zero_shot_spk_id="",
+                stream=True,
+                speed=1.0,
+                text_frontend=True
+            ):
+            audio_chunk = out["tts_speech"].cpu()
+            
+            buf = io.BytesIO()
+            torchaudio.save(buf, audio_chunk, SAMPLE_RATE, format="wav")
+            buf.seek(0)
+            yield buf.read()
 
-    # 2. 제너레이터를 통해 문장 전달
-    def text_generator():
-        yield ("RESET", tagged_sentence)
-
-    # 3. GitHub 이슈에서 권장하는 방식으로 TTS 호출
-    for out in cosyvoice.inference_zero_shot_typing(
-            text_stream=text_generator(),
-            prompt_text="", 
-            prompt_speech_16k=prompt_speech_16k,
-            zero_shot_spk_id="",
-            stream=False,
-            speed=1.0,
-            text_frontend=True,
-            interleave_prompt_in_llm=False
-        ):
-        wav_parts.append(out["tts_speech"].cpu())
-
-    if not wav_parts:
-        return b""
-
-    wav_cat = torch.cat(wav_parts, dim=1)
-    buf = io.BytesIO()
-    torchaudio.save(buf, wav_cat, SAMPLE_RATE, format="wav")
-    buf.seek(0)
-    return buf.read()
+    except Exception as e:
+        logging.error(f"TTS (instruct2) Error: {e}", exc_info=True)
 
 
-# <--- 수정: 지능형 타임아웃 로직이 적용된 최종 버전 ---
 def tts_worker(sess: Session):
+    """TTS 작업을 처리하는 백그라운드 스레드"""
     last_keepalive = time.time()
     
     print(f"[{sess.sid}] TTS worker started.")
-
-    ENGLISH_FAST_TIMEOUT_SEC = 0.8
-    ENGLISH_SLOW_TIMEOUT_SEC = 2.0
-    KOREAN_TIMEOUT_SEC = 2.0
     
-    FLUSH_PUNCT = re.compile(r"[\.!\?…。\！？,;:]")
+    IDLE_FLUSH_TIMEOUT_SEC = 1.0 
 
     while not sess.stop_event.is_set():
         now = time.time()
-
-        if (now - sess.last_flush_ts) >= FLUSH_INTERVAL_SEC and sess.last_flush_idx < len(sess.text):
-            
-            last_real_char = sess.text.rstrip()[-1:] if sess.text.rstrip() else ""
-            is_ko_mode = is_korean(last_real_char)
-
-            should_flush = False
-            flush_reason = ""
-            
-            last_char = sess.text[-1:] if sess.text else ""
-
-            if is_ko_mode:
-                if FLUSH_PUNCT.match(last_char):
-                    should_flush = True
-                    flush_reason = f"Korean Punctuation ('{last_char}')"
-                elif last_char.isspace():
-                    should_flush = True
-                    flush_reason = "Korean Space"
-                elif (now - sess.last_input_ts) >= KOREAN_TIMEOUT_SEC:
-                    should_flush = True
-                    flush_reason = f"Korean Timeout ({KOREAN_TIMEOUT_SEC}s)"
-            else:
-                flush_on_punct = FLUSH_PUNCT.match(last_char)
-                flush_on_fast_timeout = last_char.isspace() and (now - sess.last_input_ts) >= ENGLISH_FAST_TIMEOUT_SEC
-                flush_on_slow_timeout = (now - sess.last_input_ts) >= ENGLISH_SLOW_TIMEOUT_SEC and sess.text[sess.last_flush_idx:].strip()
-                
-                if flush_on_punct:
-                    should_flush = True
-                    flush_reason = f"English Punctuation ('{last_char}')"
-                elif flush_on_fast_timeout:
-                    should_flush = True
-                    flush_reason = f"English Fast Timeout after space ({ENGLISH_FAST_TIMEOUT_SEC}s)"
-                elif flush_on_slow_timeout:
-                    should_flush = True
-                    flush_reason = f"English Slow Fallback Timeout ({ENGLISH_SLOW_TIMEOUT_SEC}s)"
-
-            if should_flush:
-                print(f"[{sess.sid}] DEBUG: Flushing triggered by: {flush_reason}.")
-                enqueue_flushable_sentences(sess, force=True)
+        has_new_text = sess.last_flush_idx < len(sess.text)
+        is_idle_timeout = (now - sess.last_input_ts) >= IDLE_FLUSH_TIMEOUT_SEC
+        
+        if has_new_text and is_idle_timeout:
+            logging.debug(f"[{sess.sid}] Flushing due to IDLE timeout ({IDLE_FLUSH_TIMEOUT_SEC}s).")
+            enqueue_flushable_sentences(sess, force=True)
 
         try:
             sentence = sess.tts_q.get(timeout=0.1)
@@ -228,12 +239,20 @@ def tts_worker(sess: Session):
 
         if sentence:
             try:
-                wav_bytes = synth_sentence_to_wav_bytes(sentence)
-                if wav_bytes:
-                    b64 = base64.b64encode(wav_bytes).decode("utf-8")
-                    sess.sse_q.put(json.dumps({"type": "audio", "b64wav": b64}))
-                else:
-                    sess.sse_q.put(json.dumps({"type": "log", "msg": "empty audio"}))
+                chunk_count = 0
+                for wav_chunk_bytes in stream_sentence_to_wav_chunks(sentence):
+                    if wav_chunk_bytes:
+                        # <<<--- 여기서 노이즈 제거 함수 호출! ---
+                        enhanced_chunk_bytes = denoise_audio_chunk(wav_chunk_bytes, SAMPLE_RATE)
+                        # ----------------------------------------
+                        
+                        b64 = base64.b64encode(enhanced_chunk_bytes).decode("utf-8")
+                        sess.sse_q.put(json.dumps({"type": "audio", "b64wav": b64}))
+                        chunk_count += 1
+                
+                if chunk_count == 0:
+                    sess.sse_q.put(json.dumps({"type": "log", "msg": "empty audio stream"}))
+
             except Exception as e:
                 logging.error(f"TTS Error: {e}", exc_info=True)
                 sess.sse_q.put(json.dumps({"type": "log", "msg": f"TTS error: {e}"}))
@@ -243,7 +262,6 @@ def tts_worker(sess: Session):
             last_keepalive = time.time()
 
     sess.sse_q.put(json.dumps({"type": "end"}))
-    
     print(f"[{sess.sid}] TTS worker stopped.")
 
 # ==============================
@@ -262,6 +280,9 @@ def type_event():
     sess = get_or_create_session(sid)
     sess.text = text
     sess.last_input_ts = time.time()
+    
+    enqueue_flushable_sentences(sess, force=False)
+    
     return jsonify({"ok": True})
 
 @app.route("/sse_audio")
