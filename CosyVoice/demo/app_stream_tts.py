@@ -30,6 +30,19 @@ sys.path.append(os.path.join(PROJ_DIR, "third_party", "Matcha-TTS"))
 from cosyvoice.cli.cosyvoice import CosyVoice2
 from cosyvoice.utils.file_utils import load_wav, logging
 
+# --- 강력한 로깅 설정 (기존 basicConfig 대체) ---
+# 모든 기존 로거의 핸들러를 제거 (Flask/werkzeug의 기본 핸들러 포함)
+for handler in logging.root.handlers[:]:
+    logging.root.removeHandler(handler)
+
+# 여기에 우리의 설정을 다시 적용 (stream=sys.stdout 추가)
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    stream=sys.stdout
+)
+# --- 설정 끝 ---
+
 app = Flask(__name__)
 
 MODEL_DIR = os.path.join(PROJ_DIR, "pretrained_models", "CosyVoice2-0.5B")
@@ -56,6 +69,33 @@ def is_korean(char: str) -> bool:
         return False
     return '\uac00' <= char <= '\ud7a3'
 
+def denoise_audio_chunk(wav_bytes: bytes, sample_rate: int) -> bytes:
+    """
+    오디오 청크(bytes)에서 저주파 노이즈(럼블)를 제거합니다.
+    """
+    if not wav_bytes:
+        return wav_bytes
+
+    try:
+        # 1. Bytes -> Tensor 변환
+        buf = io.BytesIO(wav_bytes)
+        waveform, sr = torchaudio.load(buf)
+
+        # 2. 저주파 노이즈 제거를 위한 High-pass 필터 적용
+        # 80Hz 이하의 소리(웅웅거리는 배경음, 마이크 럼블 등)를 줄입니다.
+        cutoff_freq = 80
+        enhanced_waveform = torchaudio.functional.highpass_biquad(waveform, sample_rate, cutoff_freq)
+
+        # 3. Tensor -> Bytes 변환
+        out_buf = io.BytesIO()
+        torchaudio.save(out_buf, enhanced_waveform, sample_rate, format="wav")
+        out_buf.seek(0)
+        return out_buf.read()
+    except Exception as e:
+        # 오디오 처리 중 오류 발생 시 원본을 그대로 반환
+        logging.error(f"Denoising error: {e}")
+        return wav_bytes
+
 # ==============================
 # 1) Session Management
 # ==============================
@@ -73,7 +113,6 @@ class Session:
 
 SESSIONS: Dict[str, Session] = {}
 SESS_LOCK = threading.Lock()
-
 KEEPALIVE_SEC = 15.0
 
 def get_or_create_session(sid: str) -> Session:
@@ -100,7 +139,6 @@ def enqueue_flushable_sentences(sess: Session, force: bool = False):
     
     sentence_re = re.compile(r"[^\.!\?…。\！？,;:]*[\.!\?…。\！？,;:]")
 
-    # 정규식으로 문장 분리 (원래 구두점 유지)
     for m in sentence_re.finditer(new_segment):
         end = m.end()
         chunk = new_segment[:end].strip()
@@ -111,17 +149,14 @@ def enqueue_flushable_sentences(sess: Session, force: bool = False):
 
     sess.last_flush_idx += consumed
 
-    # <<<--- 중요 변경: force=True (타임아웃)일 때만 마침표 추가 ---
     if force:
         rest = new_segment.strip()
         if rest:
-            # 타임아웃으로 잘린 문장 끝에 마침표 추가
             punctuation = ".!?…。！？,;:"
             if not rest.endswith(tuple(punctuation)):
                 rest += "."
             sentences.append(rest)
         sess.last_flush_idx = len(sess.text)
-    # --- 변경 끝 --->
 
     if sentences:
         sess.last_flush_ts = time.time()
@@ -134,9 +169,7 @@ def enqueue_flushable_sentences(sess: Session, force: bool = False):
 # ==============================
 def stream_sentence_to_wav_chunks(sentence: str) -> Generator[bytes, None, None]:
     """한 문장을 받아 오디오 청크(chunk)들을 스트리밍으로 반환하는 제너레이터"""
-    # <<<--- 중요 변경: 이 함수에서 구두점을 추가하는 로직 삭제 ---
     final_sentence = sentence.strip()
-    # --- 변경 끝 --->
 
     first_char = final_sentence.lstrip()[:1]
     is_ko = is_korean(first_char)
@@ -144,15 +177,15 @@ def stream_sentence_to_wav_chunks(sentence: str) -> Generator[bytes, None, None]
     instruction = ""
     if is_ko:
         tagged_sentence = f"<|ko|>{final_sentence}"
-        instruction = "한국어발음으로 정확하게 해줘."
+        instruction = "한국어로 자연스럽고 유창하게 읽어주세요."
     else:
         tagged_sentence = f"<|en|>{final_sentence}"
-        instruction = "Please pronounce it clearly and articulately in English."
+        instruction = "Read the following text in a natural and fluent manner."
 
     try:
-        for out in cosyvoice.inference_instruct2(
+        for out in cosyvoice.inference_zero_shot(
                 tts_text=tagged_sentence,
-                instruct_text=instruction,
+                prompt_text=instruction,
                 prompt_speech_16k=prompt_speech_16k,
                 zero_shot_spk_id="",
                 stream=True,
@@ -181,7 +214,6 @@ def tts_worker(sess: Session):
     while not sess.stop_event.is_set():
         now = time.time()
         has_new_text = sess.last_flush_idx < len(sess.text)
-
         is_idle_timeout = (now - sess.last_input_ts) >= IDLE_FLUSH_TIMEOUT_SEC
         
         if has_new_text and is_idle_timeout:
@@ -198,7 +230,11 @@ def tts_worker(sess: Session):
                 chunk_count = 0
                 for wav_chunk_bytes in stream_sentence_to_wav_chunks(sentence):
                     if wav_chunk_bytes:
-                        b64 = base64.b64encode(wav_chunk_bytes).decode("utf-8")
+                        # <<<--- 여기서 노이즈 제거 함수 호출! ---
+                        enhanced_chunk_bytes = denoise_audio_chunk(wav_chunk_bytes, SAMPLE_RATE)
+                        # ----------------------------------------
+                        
+                        b64 = base64.b64encode(enhanced_chunk_bytes).decode("utf-8")
                         sess.sse_q.put(json.dumps({"type": "audio", "b64wav": b64}))
                         chunk_count += 1
                 
