@@ -83,7 +83,7 @@ class CosyVoice:
             model_input = self.frontend.frontend_sft(i, spk_id)
             start_time = time.time()
             logging.info('synthesis text {}'.format(i))
-            for model_output in self.model.tts(**model_input, stream=stream, speed=speed, sample_rate=self.sample_rate):
+            for model_output in self.model.tts(**model_input, stream=stream, speed=speed):
                 speech_len = model_output['tts_speech'].shape[1] / self.sample_rate
                 logging.info('yield speech len {}, rtf {}'.format(speech_len, (time.time() - start_time) / speech_len))
                 yield model_output
@@ -97,18 +97,18 @@ class CosyVoice:
             model_input = self.frontend.frontend_zero_shot(i, prompt_text, prompt_speech_16k, self.sample_rate, zero_shot_spk_id)
             start_time = time.time()
             logging.info('synthesis text {}'.format(i))
-            for model_output in self.model.tts(**model_input, stream=stream, speed=speed, sample_rate=self.sample_rate):
+            for model_output in self.model.tts(**model_input, stream=stream, speed=speed):
                 speech_len = model_output['tts_speech'].shape[1] / self.sample_rate
                 logging.info('yield speech len {}, rtf {}'.format(speech_len, (time.time() - start_time) / speech_len))
                 yield model_output
                 start_time = time.time()
 
-    def inference_cross_lingual(self, tts_text, prompt_speech_16k, zero_shot_spk_id='', stream=False, speed=1.0, text_frontend=True, **kwargs):
+    def inference_cross_lingual(self, tts_text, prompt_speech_16k, zero_shot_spk_id='', stream=False, speed=1.0, text_frontend=True):
         for i in tqdm(self.frontend.text_normalize(tts_text, split=True, text_frontend=text_frontend)):
             model_input = self.frontend.frontend_cross_lingual(i, prompt_speech_16k, self.sample_rate, zero_shot_spk_id)
             start_time = time.time()
             logging.info('synthesis text {}'.format(i))
-            for model_output in self.model.tts(**model_input, stream=stream, speed=speed, sample_rate=self.sample_rate, **kwargs):
+            for model_output in self.model.tts(**model_input, stream=stream, speed=speed):
                 speech_len = model_output['tts_speech'].shape[1] / self.sample_rate
                 logging.info('yield speech len {}, rtf {}'.format(speech_len, (time.time() - start_time) / speech_len))
                 yield model_output
@@ -123,7 +123,7 @@ class CosyVoice:
             model_input = self.frontend.frontend_instruct(i, spk_id, instruct_text)
             start_time = time.time()
             logging.info('synthesis text {}'.format(i))
-            for model_output in self.model.tts(**model_input, stream=stream, speed=speed, sample_rate=self.sample_rate):
+            for model_output in self.model.tts(**model_input, stream=stream, speed=speed):
                 speech_len = model_output['tts_speech'].shape[1] / self.sample_rate
                 logging.info('yield speech len {}, rtf {}'.format(speech_len, (time.time() - start_time) / speech_len))
                 yield model_output
@@ -132,7 +132,7 @@ class CosyVoice:
     def inference_vc(self, source_speech_16k, prompt_speech_16k, stream=False, speed=1.0):
         model_input = self.frontend.frontend_vc(source_speech_16k, prompt_speech_16k, self.sample_rate)
         start_time = time.time()
-        for model_output in self.model.tts(**model_input, stream=stream, speed=speed, sample_rate=self.sample_rate):
+        for model_output in self.model.tts(**model_input, stream=stream, speed=speed):
             speech_len = model_output['tts_speech'].shape[1] / self.sample_rate
             logging.info('yield speech len {}, rtf {}'.format(speech_len, (time.time() - start_time) / speech_len))
             yield model_output
@@ -187,47 +187,8 @@ class CosyVoice2(CosyVoice):
             model_input = self.frontend.frontend_instruct2(i, instruct_text, prompt_speech_16k, self.sample_rate, zero_shot_spk_id)
             start_time = time.time()
             logging.info('synthesis text {}'.format(i))
-            for model_output in self.model.tts(**model_input, stream=stream, speed=speed, sample_rate=self.sample_rate):
+            for model_output in self.model.tts(**model_input, stream=stream, speed=speed):
                 speech_len = model_output['tts_speech'].shape[1] / self.sample_rate
                 logging.info('yield speech len {}, rtf {}'.format(speech_len, (time.time() - start_time) / speech_len))
                 yield model_output
                 start_time = time.time()
-
-    # def inference_zero_shot_typing(
-    #         self,
-    #         text_stream,
-    #         prompt_text: str,
-    #         prompt_speech_16k,
-    #         zero_shot_spk_id: str = "",
-    #         stream: bool = True,
-    #         speed: float = 1.0,
-    #         text_frontend: bool = True,
-    #         interleave_prompt_in_llm: bool = False,
-    #         **kwargs
-    #     ):
-    #     from cosyvoice.utils.file_utils import logging
-
-    #     try:
-    #         signal, text = next(text_stream)
-    #         if signal != "RESET":
-    #             logging.warning(f"Expected ('RESET', text) format in text_stream, but got signal '{signal}'")
-    #             return
-    #     except StopIteration:
-    #         return
-
-    #     tagged_sentence = text
-    #     logging.info(f"[TTS] Synthesizing with language tag: {tagged_sentence[:50]}...")
-        
-    #     try:
-    #         for out in self.inference_cross_lingual(
-    #                 tts_text=tagged_sentence,
-    #                 prompt_speech_16k=prompt_speech_16k,
-    #                 zero_shot_spk_id=zero_shot_spk_id,
-    #                 stream=False,
-    #                 speed=speed,
-    #                 text_frontend=text_frontend,
-    #                 **kwargs
-    #             ):
-    #             yield out
-    #     except Exception as e:
-    #         logging.error("[TTS] Synthesis failed: %s", e, exc_info=True)
