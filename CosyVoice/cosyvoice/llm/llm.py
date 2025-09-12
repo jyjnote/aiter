@@ -27,7 +27,7 @@ from cosyvoice.transformer.label_smoothing_loss import LabelSmoothingLoss
 from cosyvoice.utils.common import th_accuracy
 from cosyvoice.utils.file_utils import logging
 from cosyvoice.utils.mask import make_pad_mask
-
+import functools
 
 class TransformerLM(torch.nn.Module):
     def __init__(
@@ -151,6 +151,7 @@ class TransformerLM(torch.nn.Module):
             sampling: int,
             ignore_eos: bool = True,
     ):
+        logging.info(f"[FUNCTION CHECK] self.sampling is pointing to: {self.sampling}")
         num_trials, max_trials = 0, 100
         while True:
             top_ids = self.sampling(weighted_scores, decoded_tokens, sampling)
@@ -172,8 +173,8 @@ class TransformerLM(torch.nn.Module):
             prompt_speech_token_len: torch.Tensor,
             embedding: torch.Tensor,
             sampling: int = 25,
-            max_token_text_ratio: float = 20, # 의심이 됨.
-            min_token_text_ratio: float = 2,
+            max_token_text_ratio: float = 20, # 의심이 됨. #20
+            min_token_text_ratio: float = 2, # 2
             uuid: str = '',
     ) -> Generator[torch.Tensor, None, None]:
         device = text.device
@@ -439,9 +440,9 @@ class Qwen2LM(TransformerLM):
             prompt_speech_token: torch.Tensor,
             prompt_speech_token_len: torch.Tensor,
             embedding: torch.Tensor,
-            sampling: int = 1,
+            sampling: int = 25,
             max_token_text_ratio: float = 15,
-            min_token_text_ratio: float = 5,
+            min_token_text_ratio: float = 2,
             uuid: str = '',
     ) -> Generator[torch.Tensor, None, None]:
         
@@ -473,6 +474,20 @@ class Qwen2LM(TransformerLM):
 
     @torch.inference_mode()
     def inference_wrapper(self, lm_input, sampling, min_len, max_len, uuid):
+        try:
+            if isinstance(self.sampling, functools.partial):
+                # .keywords 딕셔너리에서 모든 샘플링 파라미터를 가져옵니다.
+                p = self.sampling.keywords.get('top_p', 'N/A')
+                k = self.sampling.keywords.get('top_k', 'N/A')
+                win = self.sampling.keywords.get('win_size', 'N/A')
+                tau = self.sampling.keywords.get('tau_r', 'N/A')
+                
+                logging.info(f"[SAMPLING PARAM CHECK] self.sampling configured with: top_p={p}, top_k={k}, win_size={win}, tau_r={tau}")
+            else:
+                logging.info(f"[SAMPLING PARAM CHECK] self.sampling is not a functools.partial object.")
+        except Exception as e:
+            logging.error(f"[SAMPLING PARAM CHECK] Error inspecting self.sampling: {e}")
+
         if hasattr(self, 'vllm'):
             from vllm import SamplingParams, RequestOutput
             sampling_params = SamplingParams(top_k=sampling,
@@ -540,7 +555,7 @@ class Qwen2LM(TransformerLM):
             prompt_speech_token: torch.Tensor,
             prompt_speech_token_len: torch.Tensor,
             embedding: torch.Tensor,
-            sampling: int = 1,
+            sampling: int = 25,
             max_token_text_ratio: float = 20,
             min_token_text_ratio: float = 2,
     ) -> Generator[torch.Tensor, None, None]:

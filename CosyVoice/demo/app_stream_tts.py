@@ -202,7 +202,7 @@ def stream_sentence_to_wav_chunks(sentence: str) -> Generator[bytes, None, None]
                 zero_shot_spk_id="",
                 stream=True,
                 speed=1.0,
-                text_frontend=True
+                text_frontend=True,
             ):
             audio_chunk = out["tts_speech"].cpu()
             
