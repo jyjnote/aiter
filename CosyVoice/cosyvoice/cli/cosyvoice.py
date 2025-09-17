@@ -192,24 +192,3 @@ class CosyVoice2(CosyVoice):
                 logging.info('yield speech len {}, rtf {}'.format(speech_len, (time.time() - start_time) / speech_len))
                 yield model_output
                 start_time = time.time()
-    
-    def inference_zero_shot_typing(
-        self,
-        text_stream: Generator,
-        prompt_speech_16k,
-        **kwargs
-    ):
-        """텍스트 스트림(Generator)을 입력받아 Bistream 추론을 수행합니다."""
-        
-        # Generator를 텍스트 정규화 없이 바로 frontend에 전달
-        model_input = self.frontend.frontend_cross_lingual(
-            tts_text=text_stream, 
-            prompt_speech_16k=prompt_speech_16k, 
-            resample_rate=self.sample_rate,
-            zero_shot_spk_id=''
-        )
-
-        logging.info('Starting bistream synthesis')
-        # 모델의 tts 메서드 호출 (stream=True는 오디오 출력 스트리밍을 의미)
-        for model_output in self.model.tts(**model_input, stream=True, **kwargs):
-            yield model_output

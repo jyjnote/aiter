@@ -187,7 +187,7 @@ class CosyVoiceModel:
                 ratio = final_speech_token_len / input_text_token_len if input_text_token_len > 0 else 0
                 
                 logging.info(f"[FINAL-MAP | Non-streaming] uuid={uuid}")
-                logging.info(f"   raw text          : {raw_text}")
+                #logging.info(f"   raw text          : {raw_text}")
                 logging.info(f"   input_token_len   : {input_text_token_len}")
                 logging.info(f"   speech_token_len  : {final_speech_token_len}")
                 logging.info(f"   Ratio (speech/input): {ratio:.2f}")
@@ -473,3 +473,4 @@ class CosyVoice2Model(CosyVoiceModel):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             torch.cuda.current_stream().synchronize()
+            

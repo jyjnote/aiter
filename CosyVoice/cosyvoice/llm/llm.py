@@ -151,7 +151,7 @@ class TransformerLM(torch.nn.Module):
             sampling: int,
             ignore_eos: bool = True,
     ):
-        logging.info(f"[FUNCTION CHECK] self.sampling is pointing to: {self.sampling}")
+        #logging.info(f"[FUNCTION CHECK] self.sampling is pointing to: {self.sampling}")
         num_trials, max_trials = 0, 100
         while True:
             top_ids = self.sampling(weighted_scores, decoded_tokens, sampling)
@@ -161,7 +161,33 @@ class TransformerLM(torch.nn.Module):
             if num_trials > max_trials:
                 raise RuntimeError('sampling reaches max_trials {} and still get eos when ignore_eos is True, check your input!'.format(max_trials))
         return top_ids
+    # def sampling_ids(
+    #         self,
+    #         weighted_scores: torch.Tensor,
+    #         decoded_tokens: List,
+    #         sampling: int,
+    #         ignore_eos: bool = True,
+    # ):
+    #     #logging.info(f"[FUNCTION CHECK] self.sampling is pointing to: {self.sampling}")
+    #     num_trials, max_trials = 0, 100
 
+    #     # --- 핵심 수정 사항 ---
+    #     # ignore_eos가 True일 때, EOS 토큰의 확률을 음의 무한대로 만들어 선택을 원천 차단합니다.
+    #     if ignore_eos:
+    #         weighted_scores[self.speech_token_size] = -float('inf')
+    #     # --- 수정 끝 ---
+        
+    #     while True:
+    #         top_ids = self.sampling(weighted_scores, decoded_tokens, sampling)
+    #         # 이제 위에서 EOS 토큰을 비활성화했으므로, 이 루프는 사실상 불필요해지지만
+    #         # 만약을 대비해 안전장치로 남겨둡니다.
+    #         if (not ignore_eos) or (self.speech_token_size not in top_ids):
+    #             break
+    #         num_trials += 1
+    #         if num_trials > max_trials:
+    #             raise RuntimeError('sampling reaches max_trials {} and still get eos when ignore_eos is True, check your input!'.format(max_trials))
+    #     return top_ids
+        
     @torch.inference_mode()
     def inference(
             self,
@@ -441,7 +467,7 @@ class Qwen2LM(TransformerLM):
             prompt_speech_token_len: torch.Tensor,
             embedding: torch.Tensor,
             sampling: int = 25,
-            max_token_text_ratio: float = 15,
+            max_token_text_ratio: float = 20,
             min_token_text_ratio: float = 2,
             uuid: str = '',
     ) -> Generator[torch.Tensor, None, None]:
@@ -530,11 +556,11 @@ class Qwen2LM(TransformerLM):
                 top_k_logp, top_k_indices = torch.topk(logp, k=5, dim=-1)
                 log_probs_str = ", ".join([f"{idx.item()}:{lp.item():.2f}" for idx, lp in zip(top_k_indices.squeeze(), top_k_logp.squeeze())])
                 
-                logging.info(
-                    f"[SAMPLING-DEBUG] step={i}, "
-                    f"selected_token={top_ids}, "
-                    f"top_5_candidates=[{log_probs_str}]"
-                )
+                # logging.info(
+                #     f"[SAMPLING-DEBUG] step={i}, "
+                #     f"selected_token={top_ids}, "
+                #     f"top_5_candidates=[{log_probs_str}]"
+                # )
                 # ✨
                 
                 if top_ids == self.speech_token_size:

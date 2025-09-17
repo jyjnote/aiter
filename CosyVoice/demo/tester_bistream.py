@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-#  CUDA_VISIBLE_DEVICES=4 python -u demo/app_stream_tts.py
+#  CUDA_VISIBLE_DEVICES=4 python -u demo/tester_bistream.py
 import os
 import sys
 import io
@@ -88,8 +88,6 @@ def denoise_audio_chunk(wav_bytes: bytes, sample_rate: int) -> bytes:
 class Session:
     sid: str
     text: str = ""
-    last_flush_idx: int = 0
-    last_input_ts: float = field(default_factory=time.time)
     tts_q: queue.Queue = field(default_factory=queue.Queue)
     sse_q: queue.Queue = field(default_factory=queue.Queue)
 
@@ -102,29 +100,35 @@ def get_or_create_session(sid: str) -> Session:
         if sess is None:
             sess = Session(sid=sid)
             SESSIONS[sid] = sess
-            # ✨ tts_worker 스레드를 여기서 바로 시작하지 않고, 필요할 때 시작하도록 변경
     return sess
 
 def start_tts_worker_if_needed(sess: Session):
     with SESS_LOCK:
-        # 이미 워커가 실행 중인지 확인하는 로직은 단순화를 위해 생략
-        # 실험 스크립트는 세션마다 한 번만 호출하므로 문제 없음
         t = threading.Thread(target=tts_worker, args=(sess,), daemon=True)
         t.start()
 
 # ==============================
-# 2) Sentence Extraction & Queuing
+# 2) Sentence Queuing
 # ==============================
-def enqueue_flushable_sentences(sess: Session):
+def enqueue_full_sentence(sess: Session):
     sentence = sess.text.strip()
     if sentence:
-        logging.debug(f"[{sess.sid}] enqueue sentence: {sentence[:80]}")
+        logging.debug(f"[{sess.sid}] enqueue full sentence for bistream: {sentence[:80]}")
         sess.tts_q.put(sentence)
-        start_tts_worker_if_needed(sess) # ✨ 문장이 들어오면 워커 시작
+        start_tts_worker_if_needed(sess)
 
 # ==============================
-# 3) TTS Worker & Synthesizer
+# 3) TTS Worker & Synthesizer (BISTREAM VERSION)
 # ==============================
+def _create_text_generator(text: str, chunk_size: int = 2) -> Generator[str, None, None]:
+    """텍스트를 작은 조각으로 나누어 yield하는 제너레이터 (bistream용)"""
+    words = text.split()
+    for i in range(0, len(words), chunk_size):
+        chunk = " ".join(words[i:i + chunk_size]) + " "
+        logging.info(f"Yielding text for bistream: '{chunk.strip()}'")
+        yield chunk
+        time.sleep(0.05) # 실제 스트리밍 환경처럼 약간의 딜레이
+
 def stream_sentence_to_wav_chunks(sentence: str) -> Generator[bytes, None, None]:
     SEED = 1986
     random.seed(SEED)
@@ -145,12 +149,14 @@ def stream_sentence_to_wav_chunks(sentence: str) -> Generator[bytes, None, None]
         instruction = ""
 
     try:
+        # ✨✨✨ 핵심 변경: 텍스트 제너레이터를 tts_text로 전달하고, stream=True로 설정 ✨✨✨
+        tts_generator = _create_text_generator(tagged_sentence)
         for out in cosyvoice.inference_instruct2(
-                tts_text=tagged_sentence,
+                tts_text=tts_generator,
                 instruct_text=instruction,
                 prompt_speech_16k=prompt_speech_16k,
                 zero_shot_spk_id="",
-                stream=False, # 실험용으로 False 설정
+                stream=True, # bistream 모드에서는 오디오 청크를 스트리밍으로 받아야 함
                 speed=1.0,
                 text_frontend=True
             ):
@@ -162,10 +168,9 @@ def stream_sentence_to_wav_chunks(sentence: str) -> Generator[bytes, None, None]
     except Exception as e:
         logging.error(f"TTS (instruct2) Error: {e}", exc_info=True)
 
-# ✨✨✨ 자동 실험에 맞게 수정된 tts_worker 함수 ✨✨✨
 def tts_worker(sess: Session):
-    """TTS 작업을 처리하는 백그라운드 스레드 (자동 실험용 버전)"""
-    print(f"[{sess.sid}] TTS worker started.")
+    """TTS 작업을 처리하는 백그라운드 스레드 (bistream 실험용 버전)"""
+    print(f"[{sess.sid}] TTS worker started (bistream mode).")
     
     try:
         sentence = sess.tts_q.get(timeout=10.0)
@@ -185,7 +190,6 @@ def tts_worker(sess: Session):
 
     sess.sse_q.put(json.dumps({"type": "end"}))
     print(f"[{sess.sid}] TTS worker finished and sent 'end' signal.")
-    # 세션 정리 (선택 사항이지만 메모리 관리에 좋음)
     with SESS_LOCK:
         if sess.sid in SESSIONS:
             del SESSIONS[sess.sid]
@@ -206,8 +210,7 @@ def type_event():
     sess = get_or_create_session(sid)
     sess.text = text
     
-    # 실험 스크립트는 문장 전체를 한 번에 보내므로, 바로 큐에 넣고 워커 시작
-    enqueue_flushable_sentences(sess)
+    enqueue_full_sentence(sess)
     
     return jsonify({"ok": True})
 
@@ -219,21 +222,14 @@ def sse_audio():
     def event_stream():
         while True:
             try:
-                msg = sess.sse_q.get(timeout=20.0) # 타임아웃을 늘려 서버가 응답할 시간을 줌
+                msg = sess.sse_q.get(timeout=20.0)
                 yield f"data: {msg}\n\n"
-                # 'end' 메시지를 받으면 스트림 종료
                 if '"type": "end"' in msg:
                     break
             except queue.Empty:
-                # 타임아웃 발생 시 스트림 종료
                 break
     
-    headers = {
-        "Cache-Control": "no-cache",
-        "X-Accel-Buffering": "no",
-        "Content-Type": "text/event-stream",
-        "Connection": "keep-alive",
-    }
+    headers = { "Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Content-Type": "text/event-stream", "Connection": "keep-alive" }
     return Response(event_stream(), headers=headers)
 
 # ==============================
@@ -251,5 +247,4 @@ def shutdown():
 # 6) Run
 # ==============================
 if __name__ == "__main__":
-    # 자동 실험을 위해 debug=False로 설정
     app.run(host="0.0.0.0", port=8000, debug=False, threaded=True)
