@@ -149,14 +149,14 @@ def enqueue_flushable_sentences(sess: Session, force: bool = False):
 # ==============================
 def stream_sentence_to_wav_chunks(sentence: str) -> Generator[bytes, None, None]:
     """한 문장을 받아 오디오 청크(chunk)들을 스트리밍으로 반환하는 제너레이터"""
-
-    SEED = 1986
-    random.seed(SEED)
-    np.random.seed(SEED)
-    torch.manual_seed(SEED)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(SEED)
-    logging.info(f"Random seeds fixed to {SEED}")
+    # 인풋 한글을 제외한 정책이 필요 ,,
+    # SEED = 1986
+    # random.seed(SEED)
+    # np.random.seed(SEED)
+    # torch.manual_seed(SEED)
+    # if torch.cuda.is_available():
+    #     torch.cuda.manual_seed_all(SEED)
+    # logging.info(f"Random seeds fixed to {SEED}")
 
     final_sentence = sentence.strip()
 
@@ -198,7 +198,7 @@ def tts_worker(sess: Session):
     
     print(f"[{sess.sid}] TTS worker started.")
     
-    IDLE_FLUSH_TIMEOUT_SEC = 5.0 
+    IDLE_FLUSH_TIMEOUT_SEC = 1.0 
 
     while not sess.stop_event.is_set():
         now = time.time()

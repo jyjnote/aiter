@@ -673,3 +673,40 @@ class Qwen2LM(TransformerLM):
             # in stream mode, yield token one by one
             yield top_ids
             lm_input = self.speech_embedding.weight[top_ids].reshape(1, 1, -1)
+
+        @torch.inference_mode()
+        def inference_step_by_step(self, new_text_token: torch.Tensor, past_cache=None):
+            """
+            한 번의 텍스트 토큰 입력을 받아 음성 토큰과 업데이트된 cache를 반환합니다.
+            """
+            # 입력 텍스트 토큰을 임베딩합니다.
+            lm_input = self.llm.model.model.embed_tokens(new_text_token)
+            
+            out_tokens = []
+            
+            # 텍스트 입력을 처리하고 cache를 업데이트합니다.
+            # 이 단계에서는 아직 음성을 생성하지 않고, 텍스트 문맥만 cache에 반영합니다.
+            y_pred, cache = self.llm.forward_one_step(lm_input,
+                                                    masks=torch.ones((1, lm_input.shape[1], lm_input.shape[1]), device=lm_input.device).to(torch.bool),
+                                                    cache=past_cache)
+
+            # 이제부터 Autoregressive하게 음성 토큰을 생성합니다.
+            # 실제 구현에서는 몇 개의 음성 토큰을 생성할지 결정하는 로직이 필요합니다.
+            # 여기서는 단순화를 위해 하나의 음성 토큰만 생성한다고 가정합니다.
+            last_hidden_state = y_pred[:, -1]
+            
+            # 다음 토큰 예측
+            logp = self.llm_decoder(last_hidden_state).log_softmax(dim=-1)
+            top_ids = self.sampling_ids(logp.squeeze(dim=0), [], sampling=25, ignore_eos=True).item()
+
+            if top_ids < self.speech_token_size: # 유효한 음성 토큰인 경우
+                out_tokens.append(top_ids)
+                # 생성된 음성 토큰을 다음 스텝의 입력으로 준비
+                next_lm_input = self.speech_embedding.weight[top_ids].reshape(1, 1, -1)
+                
+                # 음성 토큰을 기반으로 cache를 한 번 더 업데이트
+                _, cache = self.llm.forward_one_step(next_lm_input,
+                                                    masks=torch.ones((1, next_lm_input.shape[1], next_lm_input.shape[1]), device=lm_input.device).to(torch.bool),
+                                                    cache=cache)
+
+            return out_tokens, cache
