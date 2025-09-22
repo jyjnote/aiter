@@ -109,6 +109,7 @@ def get_or_create_session(sid: str) -> Session:
 # ==============================
 # 2) Sentence Extraction & Queuing
 # ==============================
+
 def enqueue_flushable_sentences(sess: Session, force: bool = False):
     new_segment = sess.text[sess.last_flush_idx:]
     if not new_segment:
@@ -117,13 +118,18 @@ def enqueue_flushable_sentences(sess: Session, force: bool = False):
     consumed = 0
     sentences: List[str] = []
     
-    sentence_re = re.compile(r"[^\.!\?…。\！？,;:]*[\.!\?…。\！？,;:]")
+    # 문장 분리에 사용되는 구두점 문자들
+    punctuation_chars = ".!?…。！？,;:"
+    sentence_re = re.compile(r"[^" + re.escape(punctuation_chars) + r"]*[" + re.escape(punctuation_chars) + r"]")
 
     for m in sentence_re.finditer(new_segment):
         end = m.end()
         chunk = new_segment[:end].strip()
-        if chunk:
+
+        # ✨ 수정된 부분: 청크가 비어있지 않고, 구두점을 제거했을 때도 내용이 남아있는지 확인
+        if chunk and chunk.strip(punctuation_chars):
             sentences.append(chunk)
+            
         new_segment = new_segment[end:]
         consumed += end
 
@@ -131,9 +137,9 @@ def enqueue_flushable_sentences(sess: Session, force: bool = False):
 
     if force:
         rest = new_segment.strip()
-        if rest:
-            punctuation = ".!?…。！？,;:"
-            if not rest.endswith(tuple(punctuation)):
+        # ✨ 수정된 부분: 여기도 동일하게 구두점만 있는지 확인
+        if rest and rest.strip(punctuation_chars):
+            if not rest.endswith(tuple(punctuation_chars)):
                 rest += "."
             sentences.append(rest)
         sess.last_flush_idx = len(sess.text)
