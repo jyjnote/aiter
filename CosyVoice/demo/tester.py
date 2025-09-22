@@ -45,7 +45,10 @@ logging.basicConfig(
 
 app = Flask(__name__)
 
-MODEL_DIR = os.path.join(PROJ_DIR, "pretrained_models", "CosyVoice2-0.5B")
+# MODEL_DIR = os.path.join(PROJ_DIR, "pretrained_models", "CosyVoice2-0.5B")
+# PROMPT_WAV = os.path.join(PROJ_DIR, "asset", "zero_shot_prompt1.wav")
+
+MODEL_DIR = os.path.join(PROJ_DIR, "pretrained_models", "CosyVoice-KSS-Finetuned")
 PROMPT_WAV = os.path.join(PROJ_DIR, "asset", "zero_shot_prompt1.wav")
 
 if not os.path.isdir(MODEL_DIR):
