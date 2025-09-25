@@ -260,3 +260,40 @@ class CosyVoiceFrontEnd:
                        'prompt_speech_feat': prompt_speech_feat, 'prompt_speech_feat_len': prompt_speech_feat_len,
                        'flow_embedding': embedding}
         return model_input
+    
+    def frontend_acoustic_prompt(self, tts_text, prompt_speech_16k, previous_speech_tokens, resample_rate):
+        # tts_text는 음성으로 만들 텍스트
+        tts_text_token, tts_text_token_len = self._extract_text_token(tts_text)
+        
+        # prompt_speech_16k는 목소리(화자 임베딩) 추출용
+        embedding = self._extract_spk_embedding(prompt_speech_16k)
+        
+        # flow 모델에 필요한 feature와 token은 원본 prompt 오디오에서 추출
+        prompt_speech_resample = torchaudio.transforms.Resample(orig_freq=16000, new_freq=resample_rate)(prompt_speech_16k)
+        speech_feat, speech_feat_len = self._extract_speech_feat(prompt_speech_resample)
+        speech_token, speech_token_len = self._extract_speech_token(prompt_speech_16k)
+        
+        if resample_rate == 24000:
+            token_len = min(int(speech_feat.shape[1] / 2), speech_token.shape[1])
+            speech_feat, speech_feat_len[:] = speech_feat[:, :2 * token_len], 2 * token_len
+            speech_token, speech_token_len[:] = speech_token[:, :token_len], token_len
+
+        # previous_speech_tokens는 LLM의 음향 문맥으로 사용
+        llm_prompt_speech_token = torch.tensor([previous_speech_tokens], dtype=torch.int32).to(self.device)
+        llm_prompt_speech_token_len = torch.tensor([llm_prompt_speech_token.shape[1]], dtype=torch.int32).to(self.device)
+
+        model_input = {
+            'text': tts_text_token,
+            'text_len': tts_text_token_len,
+            'prompt_text': torch.zeros(1, 0, dtype=torch.int32), # 텍스트 프롬프트는 비워서 전달
+            'prompt_text_len': torch.tensor([0], dtype=torch.int32),
+            'llm_prompt_speech_token': llm_prompt_speech_token,
+            'llm_prompt_speech_token_len': llm_prompt_speech_token_len,
+            'flow_prompt_speech_token': speech_token,
+            'flow_prompt_speech_token_len': speech_token_len,
+            'prompt_speech_feat': speech_feat,
+            'prompt_speech_feat_len': speech_feat_len,
+            'llm_embedding': embedding,
+            'flow_embedding': embedding
+        }
+        return model_input

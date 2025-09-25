@@ -192,3 +192,16 @@ class CosyVoice2(CosyVoice):
                 logging.info('yield speech len {}, rtf {}'.format(speech_len, (time.time() - start_time) / speech_len))
                 yield model_output
                 start_time = time.time()
+
+# class CosyVoice2(CosyVoice): 내부에 아래 함수 추가
+
+    def inference_with_acoustic_prompt(self, tts_text, prompt_speech_16k, previous_speech_tokens=[], stream=False, speed=1.0):
+        assert isinstance(self.model, CosyVoice2Model), 'This method is only implemented for CosyVoice2!'
+        
+        # text_normalize는 여전히 필요
+        for i in tqdm(self.frontend.text_normalize(tts_text, split=True, text_frontend=True)):
+            model_input = self.frontend.frontend_acoustic_prompt(i, prompt_speech_16k, previous_speech_tokens, self.sample_rate)
+            
+            logging.info('synthesis text {} with {} acoustic prompt tokens'.format(i, len(previous_speech_tokens)))
+            for model_output in self.model.tts(**model_input, stream=stream, speed=speed):
+                yield model_output

@@ -143,6 +143,8 @@ class TransformerLM(torch.nn.Module):
         loss = self.criterion_ce(logits, lm_target)
         acc = th_accuracy(logits.view(-1, self.speech_token_size + 1), lm_target, ignore_label=IGNORE_ID)
         return {'loss': loss, 'acc': acc}
+    
+# TransformerLM 클래스 내의 sampling_ids 함수를 아래 내용으로 교체
 
     def sampling_ids(
             self,
@@ -151,16 +153,40 @@ class TransformerLM(torch.nn.Module):
             sampling: int,
             ignore_eos: bool = True,
     ):
-        #logging.info(f"[FUNCTION CHECK] self.sampling is pointing to: {self.sampling}")
-        num_trials, max_trials = 0, 100
-        while True:
-            top_ids = self.sampling(weighted_scores, decoded_tokens, sampling)
-            if (not ignore_eos) or (self.speech_token_size not in top_ids):
-                break
-            num_trials += 1
-            if num_trials > max_trials:
-                raise RuntimeError('sampling reaches max_trials {} and still get eos when ignore_eos is True, check your input!'.format(max_trials))
+        # logging.info(f"[FUNCTION CHECK] self.sampling is pointing to: {self.sampling}")
+        
+        if ignore_eos:
+            # Qwen2LM 모델은 self.stop_token_ids 라는 속성에 모든 특수 정지 토큰을 가지고 있음
+            # 이 속성이 있는지 확인하고, 있다면 모든 특수 토큰의 확률을 0으로 만듭니다.
+            if hasattr(self, 'stop_token_ids'):
+                for token_id in self.stop_token_ids:
+                    weighted_scores[token_id] = -float('inf')
+            else:
+                # 기본 EOS 토큰만 비활성화 (하위 호환성)
+                weighted_scores[self.speech_token_size] = -float('inf')
+
+        # 이제 while 루프나 추가적인 확인 없이 바로 샘플링을 호출합니다.
+        top_ids = self.sampling(weighted_scores, decoded_tokens, sampling)
+
         return top_ids
+
+    # def sampling_ids(
+    #         self,
+    #         weighted_scores: torch.Tensor,
+    #         decoded_tokens: List,
+    #         sampling: int,
+    #         ignore_eos: bool = True,
+    # ):
+    #     #logging.info(f"[FUNCTION CHECK] self.sampling is pointing to: {self.sampling}")
+    #     num_trials, max_trials = 0, 100
+    #     while True:
+    #         top_ids = self.sampling(weighted_scores, decoded_tokens, sampling)
+    #         if (not ignore_eos) or (self.speech_token_size not in top_ids):
+    #             break
+    #         num_trials += 1
+    #         if num_trials > max_trials:
+    #             raise RuntimeError('sampling reaches max_trials {} and still get eos when ignore_eos is True, check your input!'.format(max_trials))
+    #     return top_ids
     # def sampling_ids(
     #         self,
     #         weighted_scores: torch.Tensor,
@@ -553,16 +579,10 @@ class Qwen2LM(TransformerLM):
                 logp = self.llm_decoder(y_pred[:, -1]).log_softmax(dim=-1)
                 top_ids = self.sampling_ids(logp.squeeze(dim=0), out_tokens, sampling, ignore_eos=True if i < min_len else False).item()
                 
-                top_k_logp, top_k_indices = torch.topk(logp, k=5, dim=-1)
-                log_probs_str = ", ".join([f"{idx.item()}:{lp.item():.2f}" for idx, lp in zip(top_k_indices.squeeze(), top_k_logp.squeeze())])
-                
-                # logging.info(
-                #     f"[SAMPLING-DEBUG] step={i}, "
-                #     f"selected_token={top_ids}, "
-                #     f"top_5_candidates=[{log_probs_str}]"
-                # )
-                # ✨
-                
+                # --- 여기에 로그 추가 ---
+                logging.info(f"[TOKEN-DEBUG] uuid={uuid}, step={i}, generated_token_id={top_ids}")
+                # -----------------------
+
                 if top_ids == self.speech_token_size:
                     break
                 if top_ids > self.speech_token_size:
@@ -571,6 +591,80 @@ class Qwen2LM(TransformerLM):
                 yield top_ids
                 out_tokens.append(top_ids)
                 lm_input = self.speech_embedding.weight[top_ids].reshape(1, 1, -1)
+
+    # @torch.inference_mode()
+    # def inference_wrapper(self, lm_input, sampling, min_len, max_len, uuid):
+    #     try:
+    #         if isinstance(self.sampling, functools.partial):
+    #             # .keywords 딕셔너리에서 모든 샘플링 파라미터를 가져옵니다.
+    #             p = self.sampling.keywords.get('top_p', 'N/A')
+    #             k = self.sampling.keywords.get('top_k', 'N/A')
+    #             win = self.sampling.keywords.get('win_size', 'N/A')
+    #             tau = self.sampling.keywords.get('tau_r', 'N/A')
+                
+    #             logging.info(f"[SAMPLING PARAM CHECK] self.sampling configured with: top_p={p}, top_k={k}, win_size={win}, tau_r={tau}")
+    #         else:
+    #             logging.info(f"[SAMPLING PARAM CHECK] self.sampling is not a functools.partial object.")
+    #     except Exception as e:
+    #         logging.error(f"[SAMPLING PARAM CHECK] Error inspecting self.sampling: {e}")
+
+    #     if hasattr(self, 'vllm'):
+    #         from vllm import SamplingParams, RequestOutput
+    #         sampling_params = SamplingParams(top_k=sampling,
+    #                                          stop_token_ids=self.stop_token_ids,
+    #                                          min_tokens=min_len,
+    #                                          max_tokens=max_len)
+    #         with self.lock:
+    #             self.vllm.add_request(uuid, {"prompt_embeds": lm_input.squeeze(0).to(torch.bfloat16).to(lm_input.device)}, sampling_params)
+    #             self.vllm_output_queue[uuid] = queue.Queue()
+    #         out_tokens = []
+    #         while True:
+    #             with self.lock:
+    #                 if self.vllm_output_queue[uuid].empty() is True:
+    #                     request_outputs: List[RequestOutput] = self.vllm.step()
+    #                     for request_output in request_outputs:
+    #                         top_ids = list(request_output.outputs[0].token_ids)[-1]
+    #                         self.vllm_output_queue[request_output.request_id].put(top_ids)
+    #             if self.vllm_output_queue[uuid].empty() is False:
+    #                 top_ids = self.vllm_output_queue[uuid].get()
+    #                 if top_ids in self.stop_token_ids:
+    #                     break
+    #                 # in stream mode, yield token one by one
+    #                 yield top_ids
+    #                 out_tokens.append(top_ids)
+    #                 if len(out_tokens) == max_len:
+    #                     break
+    #             time.sleep(0.001)
+    #         with self.lock:
+    #             self.vllm_output_queue.pop(uuid)
+    #     else:
+    #         out_tokens = []
+    #         cache = None
+    #         for i in range(max_len):
+    #             y_pred, cache = self.llm.forward_one_step(lm_input,
+    #                                                       masks=torch.tril(torch.ones((1, lm_input.shape[1], lm_input.shape[1]), device=lm_input.device)).to(torch.bool),
+    #                                                       cache=cache)
+    #             logp = self.llm_decoder(y_pred[:, -1]).log_softmax(dim=-1)
+    #             top_ids = self.sampling_ids(logp.squeeze(dim=0), out_tokens, sampling, ignore_eos=True if i < min_len else False).item()
+                
+    #             top_k_logp, top_k_indices = torch.topk(logp, k=5, dim=-1)
+    #             log_probs_str = ", ".join([f"{idx.item()}:{lp.item():.2f}" for idx, lp in zip(top_k_indices.squeeze(), top_k_logp.squeeze())])
+                
+    #             # logging.info(
+    #             #     f"[SAMPLING-DEBUG] step={i}, "
+    #             #     f"selected_token={top_ids}, "
+    #             #     f"top_5_candidates=[{log_probs_str}]"
+    #             # )
+    #             # ✨
+                
+    #             if top_ids == self.speech_token_size:
+    #                 break
+    #             if top_ids > self.speech_token_size:
+    #                 continue
+    #             # in stream mode, yield token one by one
+    #             yield top_ids
+    #             out_tokens.append(top_ids)
+    #             lm_input = self.speech_embedding.weight[top_ids].reshape(1, 1, -1)
 
     @torch.inference_mode()
     def inference_bistream(
