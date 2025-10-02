@@ -1,147 +1,337 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+#  CUDA_VISIBLE_DEVICES=4 python -u demo/app_stream_tts.py
 import os
 import sys
 import io
+import re
 import time
+import json
+import base64
+import queue
+import threading
+import uuid
+from dataclasses import dataclass, field
+from typing import Dict, Optional, List, Generator
+
 import torch
 import torchaudio
-from typing import Generator
+from flask import Flask, request, Response, render_template, jsonify
 
-# 프로젝트 경로 설정
+import random
+import numpy as np
+# ==============================
+# 0) App & Model Init
+# ==============================
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJ_DIR = os.path.dirname(THIS_DIR)
+
 sys.path.append(PROJ_DIR)
+sys.path.append(os.path.join(PROJ_DIR, "third_party", "Matcha-TTS"))
 
 from cosyvoice.cli.cosyvoice import CosyVoice2
 from cosyvoice.utils.file_utils import load_wav, logging
 
-# 로깅 설정
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# --- 강력한 로깅 설정 (기존 basicConfig 대체) ---
+# 모든 기존 로거의 핸들러를 제거 (Flask/werkzeug의 기본 핸들러 포함)
+for handler in logging.root.handlers[:]:
+    logging.root.removeHandler(handler)
 
-class ContextualTTSStreamer:
+# 여기에 우리의 설정을 다시 적용 (stream=sys.stdout 추가)
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    stream=sys.stdout
+)
+# --- 설정 끝 ---
+
+app = Flask(__name__)
+
+# MODEL_DIR = os.path.join(PROJ_DIR, "pretrained_models", "CosyVoice2-0.5B")
+# PROMPT_WAV = os.path.join(PROJ_DIR, "asset", "zero_shot_prompt1.wav")
+
+MODEL_DIR = os.path.join(PROJ_DIR, "pretrained_models", "CosyVoice-KSS-Finetuned")
+PROMPT_WAV = os.path.join(PROJ_DIR, "asset", "zero_shot_prompt1.wav")
+
+if not os.path.isdir(MODEL_DIR):
+    raise FileNotFoundError(f"{MODEL_DIR} does not exist! (expected CosyVoice2-0.5B)")
+if not os.path.isfile(PROMPT_WAV):
+    raise FileNotFoundError(f"{PROMPT_WAV} not found!")
+
+print("서버 시작: CosyVoice2 로드…")
+cosyvoice = CosyVoice2(model_dir=MODEL_DIR, fp16=False)
+prompt_speech_16k = load_wav(PROMPT_WAV, 16000)
+print("모델 로드 완료.")
+
+SAMPLE_RATE = cosyvoice.sample_rate
+
+# ==============================
+# Helper Functions
+# ==============================
+def is_korean(char: str) -> bool:
+    """주어진 문자가 한글 범위(가-힣)에 있는지 확인합니다."""
+    if not char:
+        return False
+    return '\uac00' <= char <= '\ud7a3'
+
+# --- ✨ denoise_audio_chunk 함수가 여기서 삭제되었습니다 ---
+
+# ==============================
+# 1) Session Management
+# ==============================
+@dataclass
+class Session:
+    sid: str
+    text: str = ""
+    last_flush_idx: int = 0
+    last_input_ts: float = field(default_factory=time.time)
+    last_flush_ts: float = field(default_factory=time.time)
+    tts_q: queue.Queue = field(default_factory=queue.Queue)
+    sse_q: queue.Queue = field(default_factory=queue.Queue)
+    worker_thread: Optional[threading.Thread] = None
+    stop_event: threading.Event = field(default_factory=threading.Event)
+
+SESSIONS: Dict[str, Session] = {}
+SESS_LOCK = threading.Lock()
+KEEPALIVE_SEC = 15.0
+
+def get_or_create_session(sid: str) -> Session:
+    with SESS_LOCK:
+        sess = SESSIONS.get(sid)
+        if sess is None:
+            sess = Session(sid=sid)
+            SESSIONS[sid] = sess
+            t = threading.Thread(target=tts_worker, args=(sess,), daemon=True)
+            t.start()
+            sess.worker_thread = t
+    return sess
+
+# ==============================
+# 2) Sentence Extraction & Queuing
+# ==============================
+def enqueue_flushable_sentences(sess: Session, force: bool = False):
     """
-    어절 단위로 문맥을 유지하며 TTS 스트리밍을 관리하는 클래스
+    사용자 의도에 맞춘 스트리밍 정책으로 텍스트를 분리하여 TTS 큐에 추가합니다.
+    1. (최우선) 문장에 구두점(.!?)이 있으면 거기까지 분리
+    2. 문장 안의 띄어쓰기(space) 총 개수가 3개 이상이면 마지막 띄어쓰기까지 분리
+    3. force=True일 경우 남아있는 모든 텍스트 분리
     """
-    def __init__(self, model: CosyVoice2, prompt_wav_path: str):
-        self.model = model
-        self.prompt_speech_16k = load_wav(prompt_wav_path, 16000)
-        self.sample_rate = self.model.sample_rate
-        self.full_text_context = ""
-        logging.info("ContextualTTSStreamer가 초기화되었습니다.")
+    # 아직 처리되지 않은 새로운 텍스트 세그먼트
+    new_segment = sess.text[sess.last_flush_idx:]
+    if not new_segment:
+        return
 
-    def reset(self):
-        """문맥을 초기화합니다."""
-        self.full_text_context = ""
-        logging.info("문맥이 초기화되었습니다.")
+    sentences: List[str] = []
+    consumed = 0
 
-    def stream_chunk(self, text_chunk: str) -> Generator[torch.Tensor, None, None]:
-        """
-        하나의 텍스트 어절(chunk)을 받아 오디오 텐서(Tensor)를 스트리밍으로 반환합니다.
+    # 세그먼트를 계속해서 처리하는 루프
+    processing_segment = new_segment
+    while processing_segment:
+        chunk_to_process = None
+        consumed_this_round = 0
 
-        Args:
-            text_chunk (str): 음성으로 변환할 새로운 텍스트 어절 (예: "뭐해")
-
-        Yields:
-            torch.Tensor: 생성된 오디오 청크
-        """
-        if not text_chunk.strip():
-            return
-
-        # 언어 태그 추가 (예시: 한국어)
-        # 실제 애플리케이션에서는 언어 감지 로직이 필요할 수 있습니다.
-        tagged_chunk = f"<|ko|>{text_chunk}"
+        punctuation_chars = ".!?…。！？,;:"
         
-        logging.info(f"음성 생성 요청...")
-        logging.info(f"  - 문맥 (instruct_text): '{self.full_text_context}'")
-        logging.info(f"  - 대상 (tts_text)    : '{tagged_chunk}'")
+        # 1순위: 구두점 확인
+        first_punct_idx = -1
+        for char in punctuation_chars:
+            idx = processing_segment.find(char)
+            if idx != -1 and (first_punct_idx == -1 or idx < first_punct_idx):
+                first_punct_idx = idx
+
+        if first_punct_idx != -1:
+            # 구두점을 찾았다면 거기까지를 청크로 확정
+            end_pos = first_punct_idx + 1
+            chunk_to_process = processing_segment[:end_pos]
+            consumed_this_round = len(chunk_to_process)
+
+        # 2순위: 띄어쓰기 개수 확인 (구두점이 없을 경우에만)
+        elif processing_segment.count(' ') >= 3:
+            # 띄어쓰기가 3개 이상이면, 마지막 띄어쓰기 위치를 찾음
+            end_pos = processing_segment.rfind(' ')
+            # 마지막 띄어쓰기까지의 텍스트를 청크로 확정
+            chunk_to_process = processing_segment[:end_pos]
+            consumed_this_round = len(chunk_to_process)
+        
+        # force=True 이고, 아직 처리할 텍스트가 남은 경우
+        elif force and processing_segment.strip():
+            chunk_to_process = processing_segment
+            if not chunk_to_process.endswith(tuple(punctuation_chars)):
+                chunk_to_process += "."
+            consumed_this_round = len(chunk_to_process)
+
+        # 처리할 청크가 결정되었다면
+        if chunk_to_process:
+            clean_chunk = chunk_to_process.strip()
+            if clean_chunk:
+                sentences.append(clean_chunk)
+            
+            consumed += consumed_this_round
+            processing_segment = processing_segment[consumed_this_round:]
+            
+            # force 모드는 한 번에 모두 처리하고 종료
+            if force:
+                break
+        else:
+            # 아무 조건도 만족하지 않으면 루프 종료 (다음 입력을 기다림)
+            break
+            
+    # 최종적으로 처리된 길이만큼 인덱스 업데이트
+    sess.last_flush_idx += consumed
+
+    # 생성된 문장들을 TTS 큐에 추가
+    if sentences:
+        sess.last_flush_ts = time.time()
+        for s in sentences:
+            logging.debug(f"[{sess.sid}] enqueue sentence by space count: {s[:80]}{'...' if len(s)>80 else ''}")
+            sess.tts_q.put(s)
+
+# ==============================
+# 3) TTS Worker & Synthesizer
+# ==============================
+def stream_sentence_to_wav_chunks(sentence: str) -> Generator[bytes, None, None]:
+    """한 문장을 받아 오디오 청크(chunk)들을 스트리밍으로 반환하는 제너레이터"""
+    # 인풋 한글을 제외한 정책이 필요 ,,
+    # SEED = 1986
+    # random.seed(SEED)
+    # np.random.seed(SEED)
+    # torch.manual_seed(SEED)
+    # if torch.cuda.is_available():
+    #     torch.cuda.manual_seed_all(SEED)
+    # logging.info(f"Random seeds fixed to {SEED}")
+
+    final_sentence = sentence.strip()
+
+    first_char = final_sentence.lstrip()[:1]
+    is_ko = is_korean(first_char)
+
+    instruction = ""
+    if is_ko:
+        tagged_sentence = f"<|ko|>{final_sentence}"
+        instruction = ""
+    else:
+        tagged_sentence = f"<|en|>{final_sentence}"
+        instruction = ""
+
+    try:
+        for out in cosyvoice.inference_instruct2(
+                tts_text=tagged_sentence,
+                instruct_text=instruction,
+                prompt_speech_16k=prompt_speech_16k,
+                zero_shot_spk_id="",
+                stream=True, 
+                speed=1.0,
+                text_frontend=True,
+        ):
+            audio_chunk = out["tts_speech"].cpu()
+            
+            buf = io.BytesIO()
+            torchaudio.save(buf, audio_chunk, SAMPLE_RATE, format="wav")
+            buf.seek(0)
+            yield buf.read()
+
+    except Exception as e:
+        logging.error(f"TTS (instruct2) Error: {e}", exc_info=True)
+
+
+def tts_worker(sess: Session):
+    """TTS 작업을 처리하는 백그라운드 스레드"""
+    last_keepalive = time.time()
+    
+    print(f"[{sess.sid}] TTS worker started.")
+    
+    IDLE_FLUSH_TIMEOUT_SEC = 5.0 
+
+    while not sess.stop_event.is_set():
+        now = time.time()
+        has_new_text = sess.last_flush_idx < len(sess.text)
+        is_idle_timeout = (now - sess.last_input_ts) >= IDLE_FLUSH_TIMEOUT_SEC
+        
+        if has_new_text and is_idle_timeout:
+            logging.debug(f"[{sess.sid}] Flushing due to IDLE timeout ({IDLE_FLUSH_TIMEOUT_SEC}s).")
+            enqueue_flushable_sentences(sess, force=True)
 
         try:
-            # inference_instruct2를 사용하여 스트리밍 생성
-            # instruct_text에는 이전까지의 문맥을, tts_text에는 현재 어절을 전달
-            for out in self.model.inference_instruct2(
-                tts_text=tagged_chunk,
-                instruct_text=self.full_text_context,
-                prompt_speech_16k=self.prompt_speech_16k,
-                stream=True,
-                speed=1.0
-            ):
-                audio_tensor = out["tts_speech"].cpu()
-                yield audio_tensor
-            
-            logging.info(f"'{text_chunk}' 어절 생성 완료.")
+            sentence = sess.tts_q.get(timeout=0.1)
+        except queue.Empty:
+            sentence = None
 
-            # 현재 어절을 다음을 위한 문맥에 추가
-            if self.full_text_context:
-                self.full_text_context += f" {text_chunk}"
-            else:
-                self.full_text_context = text_chunk
-        
-        except Exception as e:
-            logging.error(f"TTS 생성 중 오류 발생: {e}", exc_info=True)
+        if sentence:
+            try:
+                chunk_count = 0
+                for wav_chunk_bytes in stream_sentence_to_wav_chunks(sentence):
+                    if wav_chunk_bytes:
+                        # --- ✨ 수정된 부분: denoise 함수 호출을 제거하고 원본 청크를 바로 사용 ---
+                        b64 = base64.b64encode(wav_chunk_bytes).decode("utf-8")
+                        sess.sse_q.put(json.dumps({"type": "audio", "b64wav": b64}))
+                        chunk_count += 1
+                
+                if chunk_count == 0:
+                    sess.sse_q.put(json.dumps({"type": "log", "msg": "empty audio stream"}))
 
+            except Exception as e:
+                logging.error(f"TTS Error: {e}", exc_info=True)
+                sess.sse_q.put(json.dumps({"type": "log", "msg": f"TTS error: {e}"}))
 
-def main():
-    # --- 1. 모델 및 프롬프트 초기화 ---
-    model_dir = os.path.join(PROJ_DIR, "pretrained_models", "CosyVoice-KSS-Finetuned")
-    prompt_wav = os.path.join(PROJ_DIR, "asset", "zero_shot_prompt1.wav")
+        if (time.time() - last_keepalive) >= KEEPALIVE_SEC:
+            sess.sse_q.put(json.dumps({"type": "ping"}))
+            last_keepalive = time.time()
 
-    if not os.path.isdir(model_dir):
-        raise FileNotFoundError(f"모델 디렉터리를 찾을 수 없습니다: {model_dir}")
-    if not os.path.isfile(prompt_wav):
-        raise FileNotFoundError(f"프롬프트 WAV 파일을 찾을 수 없습니다: {prompt_wav}")
+    sess.sse_q.put(json.dumps({"type": "end"}))
+    print(f"[{sess.sid}] TTS worker stopped.")
 
-    print("서버 시작: CosyVoice2 로드 중...")
-    cosyvoice = CosyVoice2(model_dir=model_dir, fp16=False)
-    print("모델 로드 완료.")
+# ==============================
+# 4) HTTP Routes
+# ==============================
+@app.route("/")
+def index():
+    return render_template("index.html")
 
-    # --- 2. 스트리머 객체 생성 ---
-    streamer = ContextualTTSStreamer(model=cosyvoice, prompt_wav_path=prompt_wav)
+@app.route("/type", methods=["POST"])
+def type_event():
+    data = request.get_json(force=True)
+    sid = data.get("sid") or str(uuid.uuid4())
+    text = data.get("text", "")
 
-    # --- 3. TTS 스트리밍 시뮬레이션 ---
-    full_sentence = "오늘은 뭐해 집에서 쉴래?"
-    chunks = full_sentence.split(' ')
+    # ---  디버깅을 위한 로그 추가 ---
+    # 받은 텍스트가 어떤 형태인지 터미널에 그대로 출력합니다.
+    logging.info(f"[{sid}] Received text: '{text}'")
+    # --------------------------------
 
-    print(f"\n입력 문장: '{full_sentence}'")
-    print(f"어절 단위로 음성 생성을 시작합니다: {chunks}")
-
-    output_dir = "tts_output_chunks"
-    os.makedirs(output_dir, exist_ok=True)
+    sess = get_or_create_session(sid)
+    sess.text = text
+    sess.last_input_ts = time.time()
     
-    # 생성된 모든 오디오 청크를 모으기 위한 리스트
-    all_audio_chunks = []
+    enqueue_flushable_sentences(sess, force=False)
+    
+    return jsonify({"ok": True})
 
-    start_time = time.time()
-    for i, chunk_text in enumerate(chunks):
-        print(f"\n--- {i+1}번째 어절 처리 중: '{chunk_text}' ---")
-        
-        # 현재 어절에 대한 오디오 스트림을 받아 처리
-        audio_stream_for_chunk = []
-        for audio_chunk_tensor in streamer.stream_chunk(chunk_text):
-            audio_stream_for_chunk.append(audio_chunk_tensor)
-            # (실제 스트리밍 앱에서는 여기서 바로 클라이언트로 전송)
+@app.route("/sse_audio")
+def sse_audio():
+    sid = request.args.get("sid") or str(uuid.uuid4())
+    sess = get_or_create_session(sid)
 
-        if audio_stream_for_chunk:
-            # 어절 단위로 생성된 오디오를 하나의 텐서로 합침
-            full_audio_for_chunk = torch.cat(audio_stream_for_chunk, dim=1)
-            all_audio_chunks.append(full_audio_for_chunk)
+    def event_stream():
+        last_ping = time.time()
+        while not sess.stop_event.is_set():
+            try:
+                msg = sess.sse_q.get(timeout=0.5)
+                yield f"data: {msg}\n\n"
+            except queue.Empty:
+                if (time.time() - last_ping) >= KEEPALIVE_SEC:
+                    yield 'data: {"type":"ping"}\n\n'
+                    last_ping = time.time()
 
-            # 디버깅을 위해 각 어절별 wav 파일 저장
-            output_path = os.path.join(output_dir, f"chunk_{i}_{chunk_text}.wav")
-            torchaudio.save(output_path, full_audio_for_chunk, streamer.sample_rate)
-            print(f"-> 오디오 파일 저장 완료: {output_path}")
+    headers = {
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",
+        "Content-Type": "text/event-stream",
+        "Connection": "keep-alive",
+    }
+    return Response(event_stream(), headers=headers)
 
-    # --- 4. 전체 문장 오디오 생성 및 저장 ---
-    if all_audio_chunks:
-        final_full_audio = torch.cat(all_audio_chunks, dim=1)
-        final_output_path = os.path.join(output_dir, "final_full_sentence.wav")
-        torchaudio.save(final_output_path, final_full_audio, streamer.sample_rate)
-        print(f"\n--- 최종 결과 ---")
-        print(f"모든 어절을 합친 전체 문장 오디오 저장 완료: {final_output_path}")
-
-    end_time = time.time()
-    print(f"총 소요 시간: {end_time - start_time:.2f}초")
-
-
+# ==============================
+# 5) Run
+# ==============================
 if __name__ == "__main__":
-    main()
+    app.run(host="0.0.0.0", port=8000, debug=True, threaded=True)
