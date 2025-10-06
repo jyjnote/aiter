@@ -572,6 +572,149 @@ class Qwen2LM(TransformerLM):
                 out_tokens.append(top_ids)
                 lm_input = self.speech_embedding.weight[top_ids].reshape(1, 1, -1)
 
+    # @torch.inference_mode()
+    # def inference_bistream(
+    #         self,
+    #         text: Generator,
+    #         prompt_text: torch.Tensor,
+    #         prompt_text_len: torch.Tensor,
+    #         prompt_speech_token: torch.Tensor,
+    #         prompt_speech_token_len: torch.Tensor,
+    #         embedding: torch.Tensor,
+    #         sampling: int = 25,
+    #         max_token_text_ratio: float = 20,
+    #         min_token_text_ratio: float = 2,
+    # ) -> Generator[torch.Tensor, None, None]:
+    #     """
+    #     [상세 설명]
+    #     1. prompt_text와 prompt_speech_token을 이용해 초기 lm_input을 구성합니다.
+    #     2. text 제네레이터에서 실시간으로 텍스트 토큰을 하나씩 받아 text_cache에 누적합니다.
+    #     3. text_cache에 mix_ratio[0] 만큼의 토큰이 쌓이면, 음성 토큰 생성을 시작합니다.
+    #     4. 음성 토큰을 하나씩 생성(yield)하면서, 생성된 토큰을 다음 입력으로 사용합니다 (Auto-regressive).
+    #     5. 약 mix_ratio[1] 만큼의 음성 토큰을 생성하면, fill_token을 강제로 삽입하여 다시 텍스트를 기다리는 상태로 돌아갑니다.
+    #     6. 이 과정을 반복하며 텍스트와 음성을 실시간으로 매핑합니다.
+    #     """
+    #     logging.info(f"[STREAM-START] inference_bistream 시작. sampling={sampling}")
+        
+    #     device = prompt_text.device
+    #     # 1. 입력 준비
+    #     sos_eos_emb = self.llm_embedding.weight[self.sos_eos].reshape(1, 1, -1)
+
+    #     if prompt_speech_token_len != 0:
+    #         prompt_speech_token_emb = self.speech_embedding(prompt_speech_token)
+    #     else:
+    #         prompt_speech_token_emb = torch.zeros(1, 0, self.llm_input_size, dtype=prompt_text.dtype).to(device)
+        
+    #     lm_input = torch.concat([sos_eos_emb], dim=1)
+
+    #     # 2. 텍스트 반복 처리
+    #     out_tokens = []
+    #     cache = None
+    #     # 초기 텍스트 캐시는 프롬프트 텍스트의 임베딩으로 설정
+    #     text_cache = self.llm.model.model.embed_tokens(prompt_text)
+    #     next_fill_index = -1
+        
+    #     logging.info(f"[STREAM-INIT] 초기 text_cache 크기: {text_cache.size(1)}, 초기 prompt_speech_token 크기: {prompt_speech_token_emb.size(1)}")
+
+    #     # text 제네레이터로부터 실시간 텍스트 토큰을 받음
+    #     for this_text in text:
+    #         # 새로 들어온 텍스트 토큰을 text_cache에 추가
+    #         text_cache = torch.concat([text_cache, self.llm.model.model.embed_tokens(this_text)], dim=1)
+    #         logging.info(f"  [TEXT+] 새 텍스트 토큰 추가됨. 현재 text_cache 크기: {text_cache.size(1)}")
+
+    #         # 프롬프트 음성 토큰이 남아있다면 먼저 처리
+    #         while prompt_speech_token_emb.size(1) != 0:
+    #             if text_cache.size(1) >= self.mix_ratio[0]:
+    #                 lm_input_text = text_cache[:, :self.mix_ratio[0]]
+    #                 lm_input_speech = prompt_speech_token_emb[:, :self.mix_ratio[1]]
+    #                 logging.info(f"  [PROMPT-APPEND] 텍스트({lm_input_text.size(1)})와 프롬프트 음성({lm_input_speech.size(1)})을 lm_input에 추가")
+    #                 lm_input = torch.concat([lm_input, lm_input_text, lm_input_speech], dim=1)
+    #                 text_cache = text_cache[:, self.mix_ratio[0]:]
+    #                 prompt_speech_token_emb = prompt_speech_token_emb[:, self.mix_ratio[1]:]
+    #             else:
+    #                 logging.info(f"  [PROMPT-WAIT] 프롬프트 처리 위해 텍스트 토큰 대기 중... (현재: {text_cache.size(1)} / 필요: {self.mix_ratio[0]})")
+    #                 break
+            
+    #         # 프롬프트 음성 토큰이 모두 소진되었을 때 음성 생성 시작
+    #         if prompt_speech_token_emb.size(1) == 0:
+    #             # fill_token 직후이거나, 생성을 막 시작하는 경우 텍스트를 채워야 함
+    #             if (len(out_tokens) != 0 and out_tokens[-1] == self.speech_token_size + 2) or (len(out_tokens) == 0 and lm_input.size(1) == 1):
+    #                 logging.info("  [FILL-TOKEN DETECTED] 음성 생성을 위해 텍스트를 채워야 합니다.")
+    #                 if text_cache.size(1) >= self.mix_ratio[0]:
+    #                     lm_input_text = text_cache[:, :self.mix_ratio[0]]
+    #                     logging.info(f"    [TEXT-APPEND] lm_input에 텍스트 토큰 {lm_input_text.size(1)}개 추가")
+    #                     if len(out_tokens) != 0 and out_tokens[-1] == self.speech_token_size + 2:
+    #                         lm_input = lm_input_text
+    #                     else:
+    #                         lm_input = torch.concat([lm_input, lm_input_text], dim=1)
+    #                     text_cache = text_cache[:, self.mix_ratio[0]:]
+    #                 else:
+    #                     logging.info(f"    [TEXT-WAIT] 텍스트 토큰 대기 중... (현재: {text_cache.size(1)} / 필요: {self.mix_ratio[0]})")
+    #                     continue
+
+    #             # 음성 토큰 생성 루프
+    #             while True:
+    #                 seq_len = lm_input.shape[1] if cache is None else lm_input.shape[1] + cache[0][0].size(2)
+    #                 y_pred, cache = self.llm.forward_one_step(
+    #                     lm_input,
+    #                     masks=torch.tril(torch.ones((1, seq_len, seq_len), device=lm_input.device)).to(torch.bool),
+    #                     cache=cache
+    #                 )
+    #                 logp = self.llm_decoder(y_pred[:, -1]).log_softmax(dim=-1)
+                    
+    #                 # fill_token을 강제로 생성해야 하는 시점인지 확인
+    #                 if next_fill_index != -1 and len(out_tokens) == next_fill_index:
+    #                     top_ids = self.speech_token_size + 2  # fill_token ID
+    #                     next_fill_index += (self.mix_ratio[1] + 1)
+    #                     logging.info(f"    [FILL-FORCED] 강제로 fill_token({top_ids}) 생성. 다음 fill_token 예약: {next_fill_index}")
+    #                 else:
+    #                     top_ids = self.sampling_ids(logp.squeeze(dim=0), out_tokens, sampling, ignore_eos=True).item()
+                    
+    #                 # 생성된 토큰이 fill_token이면 다음 생성 시점을 예약
+    #                 if top_ids == self.speech_token_size + 2:
+    #                     next_fill_index = len(out_tokens) + self.mix_ratio[1] + 1
+    #                     logging.info(f"    [FILL-SAMPLED] fill_token({top_ids}) 샘플링됨. 다음 fill_token 예약: {next_fill_index}")
+
+    #                 out_tokens.append(top_ids)
+    #                 logging.info(f"      [SPEECH+] 생성된 음성 토큰: {top_ids} (총 {len(out_tokens)}개)")
+
+    #                 # 생성된 토큰이 특수 토큰(fill_token 등)인지 확인
+    #                 if top_ids >= self.speech_token_size:
+    #                     if top_ids == self.speech_token_size + 2: # fill_token이면
+    #                         break  # 내부 디코딩 루프를 탈출하여 다시 텍스트를 기다림
+    #                     else:
+    #                         raise ValueError('should not get token {}'.format(top_ids))
+                    
+    #                 yield top_ids # 실제 음성 토큰만 외부로 전달
+    #                 # 생성된 음성 토큰을 다음 스텝의 입력으로 사용
+    #                 lm_input = self.speech_embedding.weight[top_ids].reshape(1, 1, -1)
+
+    #     # 3. 모든 텍스트가 소진된 후 남은 부분 처리
+    #     task_id_emb = self.llm_embedding.weight[self.task_id].reshape(1, 1, -1)
+    #     lm_input = torch.concat([lm_input, text_cache, task_id_emb], dim=1)
+    #     logging.info('[STREAM-FINALIZE] 남은 텍스트로 최종 음성 토큰 생성 시작...')
+    #     while True:
+    #         seq_len = lm_input.shape[1] if cache is None else lm_input.shape[1] + cache[0][0].size(2)
+    #         y_pred, cache = self.llm.forward_one_step(
+    #             lm_input,
+    #             masks=torch.tril(torch.ones((1, seq_len, seq_len), device=lm_input.device)).to(torch.bool),
+    #             cache=cache
+    #         )
+    #         logp = self.llm_decoder(y_pred[:, -1]).log_softmax(dim=-1)
+    #         top_ids = self.sampling_ids(logp.squeeze(dim=0), out_tokens, sampling, ignore_eos=False).item()
+    #         out_tokens.append(top_ids)
+    #         logging.info(f"  [FINAL-SPEECH+] 생성된 음성 토큰: {top_ids} (총 {len(out_tokens)}개)")
+
+    #         if top_ids >= self.speech_token_size:
+    #             if top_ids == self.speech_token_size: # EOS 토큰이면
+    #                 logging.info("[STREAM-END] EOS 토큰 생성. 스트리밍 종료.")
+    #                 break
+    #             else:
+    #                 raise ValueError('should not get token {}'.format(top_ids))
+            
+    #         yield top_ids
+    #         lm_input = self.speech_embedding.weight[top_ids].reshape(1, 1, -1)
+
     @torch.inference_mode()
     def inference_bistream(
             self,
@@ -585,91 +728,145 @@ class Qwen2LM(TransformerLM):
             max_token_text_ratio: float = 20,
             min_token_text_ratio: float = 2,
     ) -> Generator[torch.Tensor, None, None]:
-        
-        logging.info(f"[PARAM CHECK] Qwen2LM.inference received sampling = {sampling} | inference_bistream")
+        """
+        [상세 설명]
+        1. prompt_text와 prompt_speech_token을 이용해 초기 lm_input을 구성합니다.
+        2. text 제네레이터에서 실시간으로 텍스트 토큰을 하나씩 받아 text_cache에 누적합니다.
+        3. text_cache에 mix_ratio[0] 만큼의 토큰이 쌓이면, 음성 토큰 생성을 시작합니다.
+        4. 음성 토큰을 하나씩 생성(yield)하면서, 생성된 토큰을 다음 입력으로 사용합니다 (Auto-regressive).
+        5. 약 mix_ratio[1] 만큼의 음성 토큰을 생성하면, fill_token을 강제로 삽입하여 다시 텍스트를 기다리는 상태로 돌아갑니다.
+        6. 이 과정을 반복하며 텍스트와 음성을 실시간으로 매핑합니다.
+        """
+        logging.info(f"[STREAM-START] inference_bistream 시작. sampling={sampling}")
         
         device = prompt_text.device
-        # 1. prepare input
+        # 1. 입력 준비
         sos_eos_emb = self.llm_embedding.weight[self.sos_eos].reshape(1, 1, -1)
-        task_id_emb = self.llm_embedding.weight[self.task_id].reshape(1, 1, -1)
+
         if prompt_speech_token_len != 0:
             prompt_speech_token_emb = self.speech_embedding(prompt_speech_token)
         else:
             prompt_speech_token_emb = torch.zeros(1, 0, self.llm_input_size, dtype=prompt_text.dtype).to(device)
+        
         lm_input = torch.concat([sos_eos_emb], dim=1)
 
-        # 2. iterate text
+        # 2. 텍스트 반복 처리
         out_tokens = []
         cache = None
-        # NOTE init prompt_text as text_cache as it is basically impossible prompt_speech_token/prompt_text < 15/5
+        # 초기 텍스트 캐시는 프롬프트 텍스트의 임베딩으로 설정
         text_cache = self.llm.model.model.embed_tokens(prompt_text)
         next_fill_index = -1
+        
+        logging.info(f"[STREAM-INIT] 초기 text_cache 크기: {text_cache.size(1)}, 초기 prompt_speech_token 크기: {prompt_speech_token_emb.size(1)}")
+
+        # text 제네레이터로부터 실시간 텍스트 토큰을 받음
         for this_text in text:
+            # 새로 들어온 텍스트 토큰을 text_cache에 추가
             text_cache = torch.concat([text_cache, self.llm.model.model.embed_tokens(this_text)], dim=1)
-            # prompt_speech_token_emb not empty, try append to lm_input
+            logging.info(f"  [TEXT+] 새 텍스트 토큰 추가됨. 현재 text_cache 크기: {text_cache.size(1)}")
+
+            # 프롬프트 음성 토큰이 남아있다면 먼저 처리
             while prompt_speech_token_emb.size(1) != 0:
-                if text_cache.size(1) >= self.mix_ratio[0]:
-                    lm_input_text, lm_input_speech = text_cache[:, :self.mix_ratio[0]], prompt_speech_token_emb[:, :self.mix_ratio[1]]
-                    logging.info('append {} text token {} speech token'.format(lm_input_text.size(1), lm_input_speech.size(1)))
-                    lm_input = torch.concat([lm_input, lm_input_text, lm_input_speech], dim=1)
-                    text_cache, prompt_speech_token_emb = text_cache[:, self.mix_ratio[0]:], prompt_speech_token_emb[:, self.mix_ratio[1]:]
+                # [핵심 수정] 프롬프트 처리 시에도 대기 조건을 1로 변경
+                if text_cache.size(1) >= 1:
+                    # 처리할 텍스트 길이를 프롬프트 음성 길이에 맞춰 동적으로 조절
+                    num_speech_chunks = (prompt_speech_token_emb.size(1) + self.mix_ratio[1] - 1) // self.mix_ratio[1]
+                    required_text_len = num_speech_chunks * self.mix_ratio[0]
+                    
+                    if text_cache.size(1) >= required_text_len:
+                        lm_input_text = text_cache[:, :required_text_len]
+                        lm_input_speech = prompt_speech_token_emb
+                        logging.info(f"  [PROMPT-APPEND] 텍스트({lm_input_text.size(1)})와 프롬프트 음성({lm_input_speech.size(1)})을 lm_input에 추가")
+                        lm_input = torch.concat([lm_input, lm_input_text, lm_input_speech], dim=1)
+                        text_cache = text_cache[:, required_text_len:]
+                        prompt_speech_token_emb = prompt_speech_token_emb[:, lm_input_speech.size(1):]
+                    else:
+                        break
                 else:
-                    logging.info('not enough text token to decode, wait for more')
+                    logging.info(f"  [PROMPT-WAIT] 프롬프트 처리 위해 텍스트 토큰 대기 중... (현재: {text_cache.size(1)} / 필요: 1)")
                     break
-            # no prompt_speech_token_emb remain, can decode some speech token
+            
+            # 프롬프트 음성 토큰이 모두 소진되었을 때 음성 생성 시작
             if prompt_speech_token_emb.size(1) == 0:
+                # fill_token 직후이거나, 생성을 막 시작하는 경우 텍스트를 채워야 함
                 if (len(out_tokens) != 0 and out_tokens[-1] == self.speech_token_size + 2) or (len(out_tokens) == 0 and lm_input.size(1) == 1):
-                    logging.info('get fill token, need to append more text token')
-                    if text_cache.size(1) >= self.mix_ratio[0]:
-                        lm_input_text = text_cache[:, :self.mix_ratio[0]]
-                        logging.info('append {} text token'.format(lm_input_text.size(1)))
+                    logging.info("  [FILL-TOKEN DETECTED] 음성 생성을 위해 텍스트를 채워야 합니다.")
+                    
+                    # [핵심 수정] 텍스트 캐시에 1개 이상만 있어도 바로 처리하도록 변경
+                    if text_cache.size(1) >= 1:
+                        # 캐시에 있는 모든 텍스트 토큰을 한 번에 사용
+                        lm_input_text = text_cache
+                        logging.info(f"    [TEXT-APPEND] lm_input에 텍스트 토큰 {lm_input_text.size(1)}개 추가")
                         if len(out_tokens) != 0 and out_tokens[-1] == self.speech_token_size + 2:
                             lm_input = lm_input_text
                         else:
                             lm_input = torch.concat([lm_input, lm_input_text], dim=1)
-                        text_cache = text_cache[:, self.mix_ratio[0]:]
+                        
+                        # 사용한 만큼 캐시를 비움
+                        text_cache = text_cache[:, lm_input_text.size(1):]
                     else:
-                        logging.info('not enough text token to decode, wait for more')
+                        logging.info(f"    [TEXT-WAIT] 텍스트 토큰 대기 중... (현재: {text_cache.size(1)} / 필요: 1)")
                         continue
+
+                # 음성 토큰 생성 루프
                 while True:
                     seq_len = lm_input.shape[1] if cache is None else lm_input.shape[1] + cache[0][0].size(2)
-                    y_pred, cache = self.llm.forward_one_step(lm_input,
-                                                              masks=torch.tril(torch.ones((1, seq_len, seq_len), device=lm_input.device)).to(torch.bool),
-                                                              cache=cache)
+                    y_pred, cache = self.llm.forward_one_step(
+                        lm_input,
+                        masks=torch.tril(torch.ones((1, seq_len, seq_len), device=lm_input.device)).to(torch.bool),
+                        cache=cache
+                    )
                     logp = self.llm_decoder(y_pred[:, -1]).log_softmax(dim=-1)
+                    
+                    # fill_token을 강제로 생성해야 하는 시점인지 확인
                     if next_fill_index != -1 and len(out_tokens) == next_fill_index:
-                        top_ids = self.speech_token_size + 2
+                        top_ids = self.speech_token_size + 2  # fill_token ID
                         next_fill_index += (self.mix_ratio[1] + 1)
+                        logging.info(f"    [FILL-FORCED] 강제로 fill_token({top_ids}) 생성. 다음 fill_token 예약: {next_fill_index}")
                     else:
                         top_ids = self.sampling_ids(logp.squeeze(dim=0), out_tokens, sampling, ignore_eos=True).item()
+                    
+                    # 생성된 토큰이 fill_token이면 다음 생성 시점을 예약
                     if top_ids == self.speech_token_size + 2:
                         next_fill_index = len(out_tokens) + self.mix_ratio[1] + 1
-                        logging.info('fill_token index {} next fill_token index {}'.format(len(out_tokens), next_fill_index))
+                        logging.info(f"    [FILL-SAMPLED] fill_token({top_ids}) 샘플링됨. 다음 fill_token 예약: {next_fill_index}")
+
                     out_tokens.append(top_ids)
+                    logging.info(f"      [SPEECH+] 생성된 음성 토큰: {top_ids} (총 {len(out_tokens)}개)")
+
+                    # 생성된 토큰이 특수 토큰(fill_token 등)인지 확인
                     if top_ids >= self.speech_token_size:
-                        if top_ids == self.speech_token_size + 2:
-                            break
+                        if top_ids == self.speech_token_size + 2: # fill_token이면
+                            break  # 내부 디코딩 루프를 탈출하여 다시 텍스트를 기다림
                         else:
                             raise ValueError('should not get token {}'.format(top_ids))
-                    yield top_ids
+                    
+                    yield top_ids # 실제 음성 토큰만 외부로 전달
+                    # 생성된 음성 토큰을 다음 스텝의 입력으로 사용
                     lm_input = self.speech_embedding.weight[top_ids].reshape(1, 1, -1)
 
-        # 3. final decode
+        # 3. 모든 텍스트가 소진된 후 남은 부분 처리
+        task_id_emb = self.llm_embedding.weight[self.task_id].reshape(1, 1, -1)
         lm_input = torch.concat([lm_input, text_cache, task_id_emb], dim=1)
-        logging.info('no more text token, decode until met eos')
+        logging.info('[STREAM-FINALIZE] 남은 텍스트로 최종 음성 토큰 생성 시작...')
         while True:
             seq_len = lm_input.shape[1] if cache is None else lm_input.shape[1] + cache[0][0].size(2)
-            y_pred, cache = self.llm.forward_one_step(lm_input,
-                                                      masks=torch.tril(torch.ones((1, seq_len, seq_len), device=lm_input.device)).to(torch.bool),
-                                                      cache=cache)
+            y_pred, cache = self.llm.forward_one_step(
+                lm_input,
+                masks=torch.tril(torch.ones((1, seq_len, seq_len), device=lm_input.device)).to(torch.bool),
+                cache=cache
+            )
             logp = self.llm_decoder(y_pred[:, -1]).log_softmax(dim=-1)
             top_ids = self.sampling_ids(logp.squeeze(dim=0), out_tokens, sampling, ignore_eos=False).item()
             out_tokens.append(top_ids)
+            logging.info(f"  [FINAL-SPEECH+] 생성된 음성 토큰: {top_ids} (총 {len(out_tokens)}개)")
+
             if top_ids >= self.speech_token_size:
-                if top_ids == self.speech_token_size:
+                if top_ids == self.speech_token_size: # EOS 토큰이면
+                    logging.info("[STREAM-END] EOS 토큰 생성. 스트리밍 종료.")
                     break
                 else:
                     raise ValueError('should not get token {}'.format(top_ids))
-            # in stream mode, yield token one by one
+            
             yield top_ids
             lm_input = self.speech_embedding.weight[top_ids].reshape(1, 1, -1)

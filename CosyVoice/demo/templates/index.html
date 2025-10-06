@@ -11,12 +11,12 @@
     }
     textarea {
       width: 100%;
-      height: 400px;      /* 크기 크게 */
-      font-size: 18px;      /* 글자 크게 */
+      height: 400px;
+      font-size: 18px;
       padding: 12px;
       border-radius: 8px;
       border: 1px solid #ccc;
-      resize: vertical;     /* 세로 크기 조절 가능 */
+      resize: vertical;
     }
   </style>
 </head>
@@ -32,32 +32,41 @@
   const log = document.getElementById('log');
   const player = document.getElementById('player');
 
+  // 오디오 큐 및 재생 로직 (변경 없음)
   const q = [];
   let playing = false;
-  function enqueueAndPlay(b64) {
-    const byteChars = atob(b64);
+  function enqueueAndPlay(b64) { // (Base64로 인코딩된 오디오 데이터)를 입력
+    const byteChars = atob(b64); //  Base64 데이터를 디코딩하여 바이너리 문자열로 변환
     const byteNums = new Array(byteChars.length);
     for (let i=0; i<byteChars.length; i++) byteNums[i] = byteChars.charCodeAt(i);
-    const blob = new Blob([new Uint8Array(byteNums)], {type: 'audio/wav'});
-    const url = URL.createObjectURL(blob);
-    q.push(url);
-    if (!playing) playNext();
+    const blob = new Blob([new Uint8Array(byteNums)], {type: 'audio/wav'}); // Blob 객체 생성
+    // Blob URL 생성 및 큐에 추가
+    // Blob URL은 개별 오디오 조각의 주소이고, q 배열이 이 주소들을 모아놓은 '리스트' 역할을 함
+    // URL.createObjectURL()은 Blob 객체를 가리키는 임시 URL을 생성
+    const url = URL.createObjectURL(blob); // Blob URL 생성
+    q.push(url); // 큐에 추가
+    if (!playing) playNext(); // 재생 중이 아니면 재생 시작
   }
-  function playNext() {
-    if (q.length === 0) { playing = false; return; }
-    playing = true;
-    const url = q.shift();
-    player.src = url;
-    player.play().catch(err => {
-      log.textContent += "\n[AUDIO] play error: " + err;
-      playing = false;
+  function playNext() { // 큐에서 다음 오디오 재생
+    if (q.length === 0) { playing = false; return; } // 큐가 비어있으면 종료
+    playing = true; // 재생 중 상태 설정
+    // 이전 오디오 URL 해제
+    const url = q.shift(); // 큐에서 다음 URL 가져오기
+    player.src = url; // 오디오 소스 설정
+    player.play().catch(err => { // 재생 오류 처리
+      log.textContent += "\n[AUDIO] play error: " + err; // 재생 오류 로그
+      playing = false;// 재생 중 상태 해제
     });
   }
-  player.onended = () => playNext();
+  player.onended = () => playNext();// 오디오 재생 종료 시 다음 오디오 재생
 
-  const es = new EventSource("/sse_audio?sid=" + encodeURIComponent(sid));
-  es.onmessage = (e) => {
-    try {
+  // SSE 이벤트 소스 (변경 없음)
+  // SSE는 서버에서 클라이언트로 실시간 이벤트를 푸시하는 기술
+  // 서버에서 오디오 데이터가 준비될 때마다 클라이언트로 전송
+  const es = new EventSource("/sse_audio?sid=" + encodeURIComponent(sid)); // 서버에서 오디오 데이터를 받기 위한 SSE 연결
+  es.onmessage = (e) => { // 서버에서 메시지를 받을 때마다 호출
+    try { // 메시지 파싱 및 오디오 재생
+      // 서버에서 전송된 메시지는 JSON 형식으로 인코딩되어 있음
       const msg = JSON.parse(e.data);
       if (msg.type === 'audio' && msg.b64wav) {
         enqueueAndPlay(msg.b64wav);
@@ -67,18 +76,74 @@
     }
   };
 
-  function sendText(force=false) {
-    const text = ta.value;
-    fetch('/type', {
-      method: 'POST',
+  // 텍스트 전송 함수 (변경 없음)
+  function sendText(force=false) { // 텍스트를 서버로 전송하는 함수
+    const text = ta.value; // 현재 텍스트 영역의 값
+    fetch('/type', { // 서버로 텍스트 전송
+      method: 'POST', // POST 메서드 사용
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({ sid, text, force })
     }).catch(()=>{});
   }
+// 디바운스 로직 및 조합 이벤트 처리
 
-  ta.addEventListener('input', () => sendText(false));
+  let debounceTimer;
+  const DEBOUNCE_DELAY = 300; // 디바운스 지연 시간 (밀리초)
+  // 디바운스 함수: 사용자가 입력을 멈춘 후 일정 시간(300ms) 후에 sendText 호출
+  // 사용자가 계속 입력하면 타이머가 리셋되어 sendText 호출이 지연됨
+  // 이렇게 하면 사용자가 빠르게 타이핑할 때 불필요한 서버 요청을 줄일 수 있음
+  // 단, 구두점으로 끝나는 경우에는 즉시 sendText 호출
+  // 디바운스 타이머를 설정하고, 타이머가 만료되면 sendText(false) 호출
+  // 사용자가 다시 입력하면 타이머를 리셋
+  // 'force' 플래그는 false로 설정하여 일반적인 텍스트 업데이트임을 나타냄
+  // 구두점으로 끝나는 경우에는 즉시 sendText(true) 호출
+  // 'force' 플래그는 true로 설정하여 서버에 즉시 처리하도록 지시
+  // 이렇게 하면 구두점으로 끝나는 문장은 빠르게 처리되어 자연스러운 음성 합성이 가능
+  
+  // 한국어 조합 이벤트 처리
+  // 한국어 입력은 조합 이벤트가 발생하여 완성된 글자가 입력될 때까지 기다려야 함
+  // compositionstart 이벤트: 조합이 시작될 때 발생 (조합 중임을 나타냄)
+  // compositionend 이벤트: 조합이 끝나고 글자가 확정될 때 발생
+  // 조합 중에는 디바운스 타이머를 취소하고, 조합이 끝나면 즉시 sendText 호출
+  // 이렇게 하면 조합 중인 글자가 서버로 전송되지 않고, 완성된 글자만 전송됨
+  function debouncedSendText() {
+    clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(() => {
+      sendText(false);
+    }, DEBOUNCE_DELAY);
+  }
+
+  let isComposing = false;
+
+  ta.addEventListener('compositionstart', () => {
+    isComposing = true;
+    clearTimeout(debounceTimer);
+  });
+
+  ta.addEventListener('compositionend', () => {
+    isComposing = false;
+    sendText(false);
+  });
+
+  const punctuationRegex = /[.,?!]$/; // 구두점으로 끝나는지 확인할 정규식
+
+  ta.addEventListener('input', () => {
+    if (isComposing) {
+      return; // 조합 중에는 아무것도 하지 않음
+    }
+
+    const currentText = ta.value;
+    // 마지막 글자가 구두점인지 확인
+    if (punctuationRegex.test(currentText)) {
+      clearTimeout(debounceTimer); // 진행 중인 디바운스 타이머를 취소
+      sendText(true); // 'force' 플래그를 true로 설정하여 즉시 전송
+    } else {
+      // 구두점이 아니면 기존 디바운스 로직을 따름
+      debouncedSendText();
+    }
+  });
+
 })();
 </script>
 </body>
 </html>
-
