@@ -91,7 +91,11 @@ class CosyVoiceFrontEnd:
         if isinstance(text, Generator):
             logging.info('get tts_text generator, will return _extract_text_token_generator!')
             # NOTE add a dummy text_token_len for compatibility
-            return self._extract_text_token_generator(text), torch.tensor([0], dtype=torch.int32).to(self.device)
+            
+            # [!!! V18/V19 수정 !!!]
+            # _extract_text_token_generator (토큰 단위) 대신
+            # _extract_text_chunk_generator (청크 단위)를 반환합니다.
+            return self._extract_text_chunk_generator(text), torch.tensor([0], dtype=torch.int32).to(self.device)
         else:
             text_token = self.tokenizer.encode(text, allowed_special=self.allowed_special)
             logging.info(f"[BPE-DEBUG | _extract_text_token] input='{text}'")
@@ -108,12 +112,30 @@ class CosyVoiceFrontEnd:
             text_token_len = torch.tensor([text_token.shape[1]], dtype=torch.int32).to(self.device)
             return text_token, text_token_len
 
-    # _extract_text_token 상단 위 메서드에 사용됨.
-    def _extract_text_token_generator(self, text_generator): # 스트리밍(Generator) 입력 모드에서 텍스트를 토큰 단위로 잘라 모델에 흘려보내는 역할
-        for text in text_generator: # 1. 외부에서 들어오는 텍스트 조각(Generator)을 하나씩 받음
-            text_token, _ = self._extract_text_token(text) # 2. 각 텍스트 조각을 BPE 토큰화 → 텐서로 변환
-            for i in range(text_token.shape[1]): # 3. 문장을 토큰 단위(열 단위)로 슬라이스
-                yield text_token[:, i: i + 1] # 4. 한 번에 하나의 토큰만 내보냄 (Streaming inference)
+    # [!!! V18/V19 교체 !!!]
+    # bistream을 사용하지 않으므로, 토큰 1개씩이 아니라 청크(e.g. "단어 ")
+    # 전체를 텐서로 yield 해야 합니다.
+    def _extract_text_token_generator(self, text_generator): # 스트리밍(Generator) 입력 모드
+        logging.info("[V18/V19] Using CHUNK-based generator (_extract_text_token_generator).")
+        for text_chunk_str in text_generator: # e.g., "여기에 "
+            logging.info(f"[V18/V19] Received text chunk string: '{text_chunk_str}'")
+            
+            # [V18/V19] _extract_text_token의 'else' 분기를 호출하여 텐서로 변환
+            text_chunk_tensor, _ = self._extract_text_token(text_chunk_str) 
+            
+            logging.info(f"[V18/V19] Yielding text chunk tensor: {text_chunk_tensor.shape}")
+            yield text_chunk_tensor # e.g. tensor([[57026, 132264, 220]])
+
+    # [!!! V18/V19 신규 추가 !!!]
+    # (위의 함수 대신 이 함수를 사용하도록 _extract_text_token이 수정됨)
+    def _extract_text_chunk_generator(self, text_generator):
+        logging.info("[V18/V19] Using CHUNK-based generator (_extract_text_chunk_generator).")
+        for text_chunk_str in text_generator: # text_chunk_str은 "여기에 "
+            logging.info(f"[V18/V19] Received text chunk string: '{text_chunk_str}'")
+            # _extract_text_token의 'else' 분기를 호출하여 텐서로 변환
+            text_chunk_tensor, _ = self._extract_text_token(text_chunk_str) 
+            logging.info(f"[V18/V19] Yielding text chunk tensor: {text_chunk_tensor.shape}")
+            yield text_chunk_tensor # e.g. tensor([[57026, 132264, 220]])
 
     def _extract_speech_token(self, speech):
         assert speech.shape[1] / 16000 <= 30, 'do not support extract speech token for audio longer than 30s' #16kHz 음성 파형 (길이 ≤ 30초)

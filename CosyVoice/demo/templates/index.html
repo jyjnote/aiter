@@ -141,7 +141,7 @@
     <audio id="player" style="display: none;"></audio>
 
     <div id="fake-player-container" class="fake-player-container" style="display: none;">
-      <h3>실시간 생성 중...</h3>
+      <h3>오디오 실시간 생성 중...</h3>
       <p id="fake-player-text" class="sentence-text">""</p>
       <div class="fake-progress-bar">
         <div id="fake-progress-fill" class="fake-progress-fill" style="width: 0;"></div>
@@ -185,6 +185,9 @@
   const q = [];
   let playing = false;
   
+  // --- [핵심 수정 1] ---
+  // "isWaitingForFinal" 플래그와 상관없이
+  // 모든 스트리밍 청크의 소리를 재생(q.push)합니다.
   function playStreamingChunk(b64) {
     if (!audioContext) return;
     try {
@@ -193,11 +196,13 @@
       for (let i = 0; i < byteChars.length; i++) byteNums[i] = byteChars.charCodeAt(i);
       const byteArray = new Uint8Array(byteNums);
 
+      // (1. 소리 담당) [수정] if문을 제거하여 항상 소리를 큐에 추가
       const blob = new Blob([byteArray], { type: 'audio/wav' });
       const url = URL.createObjectURL(blob);
       q.push(url);
       if (!playing) playNext();
 
+      // (2. 시각 담당) 프로그레스 바 업데이트는 항상 실행
       const bufferToDecode = byteArray.buffer.slice(0);
       audioContext.decodeAudioData(bufferToDecode, (audioBuffer) => {
         streamingDuration += audioBuffer.duration;
@@ -209,6 +214,7 @@
       addLog(`[AUDIO] 오디오 데이터 처리 오류: ${error}`);
     }
   }
+  // --- [수정 끝] ---
 
   function playNext() {
     if (q.length === 0) { playing = false; return; }
@@ -229,6 +235,8 @@
     playNext();
   };
 
+  // --- [핵심 수정 2] ---
+  // "진짜" 플레이어는 자동 재생(autoplay)을 하지 않습니다.
   function displayFinalAudio(msg) {
     fakePlayerContainer.style.display = 'none';
     streamingDuration = 0;
@@ -250,7 +258,10 @@
     const audioElement = document.createElement('audio');
     audioElement.controls = true;
     audioElement.preload = 'auto';
-    audioElement.autoplay = true; 
+    
+    // [수정] 중복 재생을 방지하기 위해 autoplay를 false로 변경
+    audioElement.autoplay = false; 
+    
     audioElement.src = msg.url; 
 
     newSentenceDiv.appendChild(textElement);
@@ -258,6 +269,7 @@
 
     resultsContainer.prepend(newSentenceDiv);
   }
+  // --- [수정 끝] ---
 
   addLog(`세션 [${sid}] 시작. SSE 연결 대기 중...`);
   const es = new EventSource("/sse_audio?sid=" + encodeURIComponent(sid)); 
@@ -268,15 +280,17 @@
     try {
       const msg = JSON.parse(e.data);
 
+      // (isWaitingForFinal 로직은 이전과 동일하게 유지)
       if (isWaitingForFinal) {
         if (msg.type === 'streaming_audio') {
-          addLog("[WAITING] 스트리밍 청크 무시함.");
+          addLog("[WAITING] 스트리밍 청크 수신 (재생 O, 프로그레스 바 O)");
+          playStreamingChunk(msg.b64wav); // (이제 이 함수는 소리를 재생함)
           return; 
         }
         if (msg.type === 'final_audio') {
           addLog(`✅ [WAITING] 최종 파일 수신: ${msg.text}`);
           isWaitingForFinal = false; 
-          displayFinalAudio(msg);
+          displayFinalAudio(msg); // (이제 이 함수는 autoplay가 꺼져있음)
           return; 
         }
         if (msg.type === 'end') {
@@ -292,6 +306,7 @@
         return; 
       }
 
+      // --- (isWaitingForFinal = false) 평소 스트리밍 로직 ---
       if (msg.type === 'streaming_audio' && msg.b64wav) {
         fakePlayerContainer.style.display = 'block';
         playStreamingChunk(msg.b64wav);
@@ -320,31 +335,36 @@
   };
 
   function sendText(force=false) {
-    const text = ta.value;
-    
-    if (force && !text) { 
-        addLog("텍스트 없이 문장 전송(.) 시도. 무시함.");
-        return;
-    }
-
-    fetch('/type', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ sid, text, force })
-    }).catch((err) => addLog(`[API] /type 호출 실패: ${err}`));
-    
-    fakePlayerText.textContent = `"${text}"`;
-    
-    if (force) {
-      // [수정] 입력창을 비우지 않음 (중복 입력 현상 방지)
-      // ta.value = ''; 
+      const text = ta.value;
       
-      q.length = 0; 
-      isWaitingForFinal = true; 
-    }
-  }
+      if (force && !text) { 
+          addLog("텍스트 없이 문장 전송(.) 시도. 무시함.");
+          return;
+      }
 
-  // --- 4. 입력 이벤트 핸들러 [핵심 수정] ---
+      fetch('/type', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ sid, text, force })
+      }).catch((err) => addLog(`[API] /type 호출 실패: ${err}`));
+      
+      fakePlayerText.textContent = `"${text}"`;
+      
+      if (force) {
+        
+        // [!!! V19.1 핵심 버그 수정 !!!]
+        // 'force=true' (문장 종료) 시,
+        // 입력창을 비워야 다음 /type 이벤트가
+        // 이전 텍스트("안녕하세요.")를 중복 전송하지 않습니다.
+        ta.value = ''; 
+        // [!!! 수정 끝 !!!]
+        
+        q.length = 0; 
+        isWaitingForFinal = true; 
+      }
+    }
+
+  // --- 4. 입력 이벤트 핸들러 (중복 전송 버그 수정됨) ---
   let isComposing = false;
   const punctuationRegex = /[.,?!]$/; 
 
@@ -353,15 +373,12 @@
     isComposing = true;
   });
 
-  // [핵심 버그 수정] 'compositionend'는 'isComposing' 플래그만 변경
   ta.addEventListener('compositionend', (e) => {
     isComposing = false;
     addLog("[INPUT] 한글 조합 완료.");
-    // [수정] handleInput(e) 호출을 여기서 삭제 (중복 호출 방지)
   });
 
   function handleInput(e) {
-    // [로그 추가] 이벤트 타입을 로그로 남김
     addLog(`[INPUT] 이벤트 발생 (Type: ${e.type}) | 조합 중: ${isComposing}`);
     
     if (isComposing) {

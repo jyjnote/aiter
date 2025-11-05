@@ -145,48 +145,46 @@ class TransformerLM(torch.nn.Module):
         return {'loss': loss, 'acc': acc}
 
     def sampling_ids(
-            self,
-            weighted_scores: torch.Tensor,
-            decoded_tokens: List,
-            sampling: int,
-            ignore_eos: bool = True,
-    ):
-        #logging.info(f"[FUNCTION CHECK] self.sampling is pointing to: {self.sampling}")
-        num_trials, max_trials = 0, 100
-        while True:
-            top_ids = self.sampling(weighted_scores, decoded_tokens, sampling)
-            if (not ignore_eos) or (self.speech_token_size not in top_ids):
-                break
-            num_trials += 1
-            if num_trials > max_trials:
-                raise RuntimeError('sampling reaches max_trials {} and still get eos when ignore_eos is True, check your input!'.format(max_trials))
-        return top_ids
-    # def sampling_ids(
-    #         self,
-    #         weighted_scores: torch.Tensor,
-    #         decoded_tokens: List,
-    #         sampling: int,
-    #         ignore_eos: bool = True,
-    # ):
-    #     #logging.info(f"[FUNCTION CHECK] self.sampling is pointing to: {self.sampling}")
-    #     num_trials, max_trials = 0, 100
+                self,
+                weighted_scores: torch.Tensor,
+                decoded_tokens: List,
+                sampling: int,
+                ignore_eos: bool = True,
+        ):
+            #logging.info(f"[FUNCTION CHECK] self.sampling is pointing to: {self.sampling}")
+            num_trials, max_trials = 0, 100
 
-    #     # --- 핵심 수정 사항 ---
-    #     # ignore_eos가 True일 때, EOS 토큰의 확률을 음의 무한대로 만들어 선택을 원천 차단합니다.
-    #     if ignore_eos:
-    #         weighted_scores[self.speech_token_size] = -float('inf')
-    #     # --- 수정 끝 ---
-        
-    #     while True:
-    #         top_ids = self.sampling(weighted_scores, decoded_tokens, sampling)
-    #         # 이제 위에서 EOS 토큰을 비활성화했으므로, 이 루프는 사실상 불필요해지지만
-    #         # 만약을 대비해 안전장치로 남겨둡니다.
-    #         if (not ignore_eos) or (self.speech_token_size not in top_ids):
-    #             break
-    #         num_trials += 1
-    #         if num_trials > max_trials:
-    #             raise RuntimeError('sampling reaches max_trials {} and still get eos when ignore_eos is True, check your input!'.format(max_trials))
-    #     return top_ids
+            # --- [!!! V19.1 핵심 수정 !!!] ---
+            # ignore_eos가 True일 때, EOS 토큰의 확률을 음의 무한대로 만들어
+            # 'self.sampling'이 EOS를 선택하는 것을 원천 차단합니다.
+            if ignore_eos:
+                # TransformerLM의 EOS ID는 self.speech_token_size 입니다.
+                weighted_scores[self.speech_token_size] = -float('inf')
+                
+                # Qwen2LM (자식 클래스)는 stop_token이 3개이므로, 
+                # 자식 클래스인 경우 다른 특수 토큰도 함께 차단합니다.
+                if isinstance(self, Qwen2LM):
+                    if self.speech_token_size + 1 < weighted_scores.size(0):
+                        weighted_scores[self.speech_token_size + 1] = -float('inf')
+                    if self.speech_token_size + 2 < weighted_scores.size(0):
+                        weighted_scores[self.speech_token_size + 2] = -float('inf')
+            # --- 수정 끝 ---
+
+            while True:
+                # [V19.1] 이제 weighted_scores에는 EOS가 비활성화되어 있습니다.
+                top_ids = self.sampling(weighted_scores, decoded_tokens, sampling)
+
+                # (참고) self.sampling이 여러 토큰을 리스트로 반환할 경우를 대비한 원본 코드
+                if (not ignore_eos) or (self.speech_token_size not in top_ids):
+                    break
+                    
+                num_trials += 1
+                # (참고) 이 루프는 이제 거의 돌지 않아야 정상이지만,
+                # 만약의 경우를 대비해 경고 및 에러를 남깁니다.
+                logging.warning(f"[SAMPLING-WARN] sampling_ids loop trial {num_trials}. top_ids={top_ids}. This shouldn't happen if EOS was disabled.")
+                if num_trials > max_trials:
+                    raise RuntimeError('sampling reaches max_trials {} and still get eos when ignore_eos is True, check your input!'.format(max_trials))
+            return top_ids
         
     @torch.inference_mode()
     def inference(

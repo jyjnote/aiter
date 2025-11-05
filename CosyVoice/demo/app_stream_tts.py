@@ -260,7 +260,7 @@ def type_event():
         
         # --- [핵심 버그 수정] ---
         # 이 라인이 "합니다합니다" 중복 버그의 원인입니다. 주석 처리합니다.
-        # sess.last_sent_len = 0 
+        sess.last_sent_len = 0 
         # --- [수정 끝] ---
 
     return jsonify({"ok": True})
