@@ -79,38 +79,6 @@
       color: #6c757d;
       margin-top: 0.5rem;
     }
-    .results-container {
-      margin-top: 2rem;
-      border-top: 1px solid #eee;
-      padding-top: 1.5rem;
-    }
-    .results-container h3 {
-      color: #343a40;
-    }
-    .sentence-item {
-      padding: 1rem;
-      background-color: #fdfdfd;
-      border: 1px solid #eee;
-      border-radius: 8px;
-      margin-bottom: 1rem;
-    }
-    .sentence-item.current {
-      border: 1px solid #007bff;
-      background-color: #f8f9fa;
-      box-shadow: 0 2px 4px rgba(0, 123, 255, 0.1);
-    }
-    .sentence-text {
-      font-size: 1.1rem;
-      color: #212529;
-      line-height: 1.6;
-      text-align: left;
-      margin-top: 0;
-      margin-bottom: 0.5rem;
-    }
-    audio {
-      width: 100%;
-      margin-top: 0.5rem;
-    }
     .log-container {
       margin-top: 2rem;
       border-top: 1px solid #eee;
@@ -149,10 +117,6 @@
       <span id="fake-duration-text" class="duration-text">0.00 초</span>
     </div>
 
-    <div id="results-container" class="results-container">
-      <h3>문장 기록</h3>
-    </div>
-
     <div class="log-container">
       <h3>상태 로그</h3>
       <pre id="log"></pre>
@@ -171,8 +135,6 @@
   const fakeProgressFill = document.getElementById('fake-progress-fill');
   const fakeDurationText = document.getElementById('fake-duration-text');
   
-  const resultsContainer = document.getElementById('results-container');
-
   const audioContext = new (window.AudioContext || window.webkitAudioContext)();
   let streamingDuration = 0; 
   let isWaitingForFinal = false; 
@@ -233,30 +195,23 @@
     fakePlayerContainer.style.display = 'none';
     streamingDuration = 0;
     
-    const oldCurrent = document.querySelector('.sentence-item.current');
-    if (oldCurrent) {
-      oldCurrent.classList.remove('current');
-      const oldAudio = oldCurrent.querySelector('audio');
-      if (oldAudio) oldAudio.pause();
-    }
+    // 최종 오디오 재생 로직
+    player.controls = true; 
+    player.src = msg.url; 
+    player.autoplay = true;
+    
+    // 재생 완료 후 스트리밍 로직 복구
+    player.onended = () => {
+      player.controls = false;
+      player.src = ''; 
+      player.onended = playNext; 
+    };
+    
+    player.play().catch(err => {
+        addLog(`[FINAL PLAYBACK ERROR] 최종 파일 재생 실패: ${err}`);
+    });
 
-    const newSentenceDiv = document.createElement('div');
-    newSentenceDiv.className = 'sentence-item current'; 
-
-    const textElement = document.createElement('p');
-    textElement.className = 'sentence-text';
-    textElement.textContent = `"${msg.text}"`;
-
-    const audioElement = document.createElement('audio');
-    audioElement.controls = true;
-    audioElement.preload = 'auto';
-    audioElement.autoplay = true; 
-    audioElement.src = msg.url; 
-
-    newSentenceDiv.appendChild(textElement);
-    newSentenceDiv.appendChild(audioElement);
-
-    resultsContainer.prepend(newSentenceDiv);
+    addLog(`[FINAL] 최종 문장 재생 시작: "${msg.text}"`);
   }
 
   addLog(`세션 [${sid}] 시작. SSE 연결 대기 중...`);
@@ -270,7 +225,7 @@
 
       if (isWaitingForFinal) {
         if (msg.type === 'streaming_audio') {
-          addLog("[WAITING] 스트리밍 청크 무시함.");
+          addLog("[WAITING] 스트리밍 청크 수신 (큐에 넣는 것 차단)."); 
           return; 
         }
         if (msg.type === 'final_audio') {
@@ -336,33 +291,32 @@
     fakePlayerText.textContent = `"${text}"`;
     
     if (force) {
-      // [수정] 입력창을 비우지 않음 (중복 입력 현상 방지)
-      // ta.value = ''; 
-      
+      // 오디오 겹침 현상 해결 및 선행 버퍼링 완료 준비
       q.length = 0; 
+      player.pause(); 
+      player.src = ''; 
+      
       isWaitingForFinal = true; 
     }
   }
 
-  // --- 4. 입력 이벤트 핸들러 [핵심 수정] ---
+  // --- 4. 입력 이벤트 핸들러 ---
   let isComposing = false;
   const punctuationRegex = /[.,?!]$/; 
+  let spaceCount = 0;
 
   ta.addEventListener('compositionstart', () => {
     addLog("[INPUT] 한글 조합 시작...");
     isComposing = true;
   });
 
-  // [핵심 버그 수정] 'compositionend'는 'isComposing' 플래그만 변경
   ta.addEventListener('compositionend', (e) => {
     isComposing = false;
     addLog("[INPUT] 한글 조합 완료.");
-    // [수정] handleInput(e) 호출을 여기서 삭제 (중복 호출 방지)
   });
 
   function handleInput(e) {
-    // [로그 추가] 이벤트 타입을 로그로 남김
-    addLog(`[INPUT] 이벤트 발생 (Type: ${e.type}) | 조합 중: ${isComposing}`);
+    addLog(`[INPUT] 이벤트 발생 (Type: ${e.type}) | 조합 중: ${isComposing} | 공백 카운트: ${spaceCount}`);
     
     if (isComposing) {
       return; 
@@ -373,10 +327,20 @@
 
     if (punctuationRegex.test(currentText)) {
       addLog("▶▶▶ 구두점 입력: 문장 전송 (force=true)");
+      spaceCount = 0; 
       sendText(true);
+    
     } else if (lastChar === ' ' && currentText.length > 1) {
-      addLog("▶ 스페이스바 입력: 단어 전송 (force=false)");
-      sendText(false);
+      spaceCount++; 
+      
+      if (spaceCount >= 2) {
+          addLog(`▶▶▶ 3번째 공백 도달 (count=${spaceCount}): 문장 강제 전송 (force=true)`);
+          spaceCount = 0; 
+          sendText(true);
+      } else {
+          addLog(`▶ 스페이스바 입력 (count=${spaceCount}): 단어 전송 (force=false)`);
+          sendText(false);
+      }
     }
   }
   
@@ -384,5 +348,3 @@
 
 })();
 </script>
-</body>
-</html>
