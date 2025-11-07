@@ -44,8 +44,8 @@ class CosyVoiceModel:
         if self.fp16 is True: # fp16 모드 설정 시, 모델을 half precision으로 변환, 메모리 절약 및 속도 향상, 단, 정확도 저하 가능성 있음, half precision은 16비트 부동소수점 형식
             self.llm.half() # LLM 모델을 half precision으로 변환
             self.flow.half()# Flow 모델을 half precision으로 변환
-        self.token_min_hop_len = 2 * self.flow.input_frame_rate # 토큰 최소 홉 길이 설정
-        self.token_max_hop_len = 4 * self.flow.input_frame_rate # 토큰 최대 홉 길이 설정 ,홉이란 신호 처리에서 한 프레임에서 다음 프레임으로 이동하는 간격을 의미
+        self.token_min_hop_len = 6 * self.flow.input_frame_rate # 토큰 최소 홉 길이 설정 (3x increase for larger chunks)
+        self.token_max_hop_len = 12 * self.flow.input_frame_rate # 토큰 최대 홉 길이 설정 (3x increase for larger chunks)
         self.token_overlap_len = 20 # 토큰 오버랩 길이 설정
         # mel fade in out
         self.mel_overlap_len = int(self.token_overlap_len / self.flow.input_frame_rate * 22050 / 256)
@@ -66,6 +66,7 @@ class CosyVoiceModel:
         self.mel_overlap_dict = {} # 세션별 mel 오버랩 저장 딕셔너리
         self.flow_cache_dict = {}# 세션별 Flow 캐시 저장 딕셔너리
         self.hift_cache_dict = {}# 세션별 HiFT 캐시 저장 딕셔너리
+        self.space_boundaries_dict = {} # 세션별 공백 위치 (자연스러운 구간 끊김을 위함)
 
     def load(self, llm_model, flow_model, hift_model): # 모델 가중치 로드 함수
         self.llm.load_state_dict(torch.load(llm_model, map_location=self.device), strict=True) # LLM 모델 가중치 로드
@@ -143,11 +144,12 @@ class CosyVoiceModel:
                 - 입력 모드, 원본 텍스트, 토큰 길이, 생성된 토큰 길이 및 비율을 로그에 기록한다.
                 - 최종적으로 생성된 모든 음성 토큰을 로그에 기록한다.
                 - LLM 작업 완료 시 로그에 기록한다.
-            
+
             """
             # 스트리밍 모드 여부를 판단하고, 로깅에 사용할 변수 초기화
             is_streaming_input = isinstance(text, Generator) # 입력이 제너레이터면 스트리밍 모드
             text_ids, raw_text = None, None # 비스트리밍 모드에서 디코딩된 원본 텍스트 저장용 변수
+            space_token_positions = [] # BPE 220 (공백) 토큰의 위치를 저장
 
             with self.llm_context, torch.cuda.amp.autocast( # 자동 혼합 정밀도 컨텍스트 매니저
                 # fp16 모드이면서 vllm이 아닌 경우에만 활성화, vllm은 별도의 fp16 처리가 필요할 수 있음, vllm은 매우 큰 언어 모델을 효율적으로 실행하기 위한 라이브러리
@@ -184,6 +186,19 @@ class CosyVoiceModel:
                     except Exception:
                         text_ids = str(text)
 
+                    # BPE 220 (공백) 토큰의 위치 찾기
+                    if isinstance(text_ids, list) and len(text_ids) > 0:
+                        if isinstance(text_ids[0], list):
+                            # 2D 리스트인 경우 (배치)
+                            for idx, token_id in enumerate(text_ids[0]):
+                                if token_id == 220:  # 공백 토큰
+                                    space_token_positions.append(idx)
+                        else:
+                            # 1D 리스트인 경우
+                            for idx, token_id in enumerate(text_ids):
+                                if token_id == 220:  # 공백 토큰
+                                    space_token_positions.append(idx)
+
                     try:
                         tok = get_qwen_tokenizer(
                             token_path="pretrained_models/CosyVoice2-0.5B/CosyVoice-BlankEN",
@@ -199,6 +214,7 @@ class CosyVoiceModel:
                     logging.info(f"[INPUT] uuid={uuid} | Non-streaming (Tensor) input.")
                     logging.info(f"   raw text   : {raw_text}")
                     logging.info(f"   text_ids   : {text_ids}")
+                    logging.info(f"   space token positions (BPE 220): {space_token_positions}")
 
                     for i in self.llm.inference(
                         text=text.to(self.device),
@@ -227,12 +243,26 @@ class CosyVoiceModel:
             if not is_streaming_input:
                 input_text_token_len = text.shape[1]
                 ratio = final_speech_token_len / input_text_token_len if input_text_token_len > 0 else 0
-                
+
+                # 공백 토큰 위치를 음성 토큰 인덱스로 매핑
+                space_speech_boundaries = []
+                if len(space_token_positions) > 0 and ratio > 0:
+                    for space_pos in space_token_positions:
+                        # 텍스트 토큰 위치를 음성 토큰 위치로 변환
+                        speech_boundary = int((space_pos + 1) * ratio)  # +1: 공백 다음 위치
+                        if speech_boundary < final_speech_token_len:
+                            space_speech_boundaries.append(speech_boundary)
+
+                    # 세션 딕셔너리에 저장
+                    with self.lock:
+                        self.space_boundaries_dict[uuid] = set(space_speech_boundaries)
+
                 logging.info(f"[FINAL-MAP | Non-streaming] uuid={uuid}")
                 #logging.info(f"   raw text          : {raw_text}")
                 logging.info(f"   input_token_len   : {input_text_token_len}")
                 logging.info(f"   speech_token_len  : {final_speech_token_len}")
                 logging.info(f"   Ratio (speech/input): {ratio:.2f}")
+                logging.info(f"   space_boundaries (speech token indices): {space_speech_boundaries}")
                 # 전체 토큰 로그가 너무 길면 터미널이 느려질 수 있으므로, 필요 시 주석 처리
                 logging.info(f"   -> all speech tokens which are generated by the model: {final_tokens}")
             else:
@@ -251,8 +281,35 @@ class CosyVoiceModel:
             )
 
 
+    def find_nearest_space_boundary(self, target_pos, uuid, search_range=50):
+        """
+        가장 가까운 공백 경계를 찾아 반환합니다.
+
+        Args:
+            target_pos: 목표 위치 (음성 토큰 인덱스)
+            uuid: 세션 식별자
+            search_range: 검색 범위 (앞뒤로 몇 개 토큰까지 검색할지)
+
+        Returns:
+            공백 경계 위치, 없으면 target_pos 반환
+        """
+        if uuid not in self.space_boundaries_dict or not self.space_boundaries_dict[uuid]:
+            return target_pos
+
+        boundaries = sorted(self.space_boundaries_dict[uuid])
+
+        # target_pos 이하에서 가장 가까운 경계 찾기 (뒤로 검색)
+        valid_boundaries = [b for b in boundaries if target_pos - search_range <= b <= target_pos]
+
+        if valid_boundaries:
+            # 가장 가까운 경계 선택
+            return max(valid_boundaries)
+
+        # 범위 내에 경계가 없으면 원래 위치 반환
+        return target_pos
+
     def vc_job(self, source_speech_token, uuid):
-        self.tts_speech_token_dict[uuid] = source_speech_token.flatten().tolist() # 레퍼런스 음성 추출 
+        self.tts_speech_token_dict[uuid] = source_speech_token.flatten().tolist() # 레퍼런스 음성 추출
         self.llm_end_dict[uuid] = True
 
     def token2wav(self, token, prompt_token, prompt_feat, embedding, uuid, finalize=False, speed=1.0):
@@ -380,6 +437,7 @@ class CosyVoiceModel:
                 self.hift_cache_dict[this_uuid] = None
                 self.mel_overlap_dict[this_uuid] = torch.zeros(1, 80, 0)
                 self.flow_cache_dict[this_uuid] = torch.zeros(1, 80, 0, 2)
+                self.space_boundaries_dict[this_uuid] = set()  # 공백 경계 초기화
             if source_speech_token.shape[1] == 0:
                 p = threading.Thread(target=self.llm_job, args=(text, prompt_text, llm_prompt_speech_token, llm_embedding, this_uuid))
             else:
@@ -387,44 +445,75 @@ class CosyVoiceModel:
             p.start()
             
             # ================================================================
-            # [핵심 수정] 스트리밍 로직 변경
+            # [적응형 청킹] 스트리밍 로직 - 빠른 시작 + 점진적으로 큰 청크
             # ================================================================
             if stream is True:
-                # 처리된 토큰의 인덱스를 추적
-                processed_tokens_len = 0
+                # 첫 번째 청크는 작게 시작 (빠른 응답)
+                initial_hop_len = 2 * self.flow.input_frame_rate
+                token_hop_len = initial_hop_len
+                chunk_count = 0
+
                 while True:
-                    # 0.02초마다 토큰 창고를 확인 (time.sleep(0.1) -> 0.02)
-                    time.sleep(0.02)
-                    with self.lock:
-                        current_tokens_len = len(self.tts_speech_token_dict[this_uuid])
-                    
-                    # [핵심 수정] 새로 생성된 토큰이 1개라도 있는지 확인
-                    if current_tokens_len > processed_tokens_len:
-                        # 새로 들어온 모든 토큰을 가져옴
-                        with self.lock:
-                            new_tokens = self.tts_speech_token_dict[this_uuid][processed_tokens_len:]
-                        
-                        this_tts_speech_token = torch.tensor(new_tokens).unsqueeze(dim=0)
+                    # 첫 몇 청크는 짧은 간격으로 체크 (빠른 응답)
+                    # 이후 청크는 긴 간격으로 체크 (효율성)
+                    if chunk_count < 3:
+                        time.sleep(0.05)  # 첫 3개 청크: 빠른 체크
+                    else:
+                        time.sleep(0.15)  # 이후: 더 많은 토큰 축적
 
-                        # [주의] finalize=True로 설정하여 매번 독립적인 오디오 조각 생성
-                        # 이렇게 하면 오버랩 로직이 비활성화되어 품질이 저하될 수 있음
+                    if len(self.tts_speech_token_dict[this_uuid]) >= token_hop_len + self.token_overlap_len:
+                        # [공백 경계 탐색] 자연스러운 끊김을 위해 공백 위치에서 자르기
+                        adjusted_hop_len = self.find_nearest_space_boundary(token_hop_len, this_uuid, search_range=100)
+
+                        # 조정된 위치가 너무 작으면 (최소 절반 이상은 유지) 원래 위치 사용
+                        if adjusted_hop_len < token_hop_len * 0.5:
+                            adjusted_hop_len = token_hop_len
+
+                        logging.info(f"[CHUNK] uuid={this_uuid} | chunk={chunk_count+1} | original_hop={token_hop_len} | adjusted_hop={adjusted_hop_len}")
+
+                        this_tts_speech_token = torch.tensor(self.tts_speech_token_dict[this_uuid][:adjusted_hop_len + self.token_overlap_len]) \
+                            .unsqueeze(dim=0)
                         this_tts_speech = self.token2wav(token=this_tts_speech_token,
-                                                        prompt_token=flow_prompt_speech_token,
-                                                        prompt_feat=prompt_speech_feat,
-                                                        embedding=flow_embedding,
-                                                        uuid=this_uuid,
-                                                        finalize=True) # finalize=True로 변경
-                        
-                        if this_tts_speech.numel() > 0:
-                            yield {'tts_speech': this_tts_speech.cpu()}
-                        
-                        # 처리된 토큰 길이를 업데이트
-                        processed_tokens_len = current_tokens_len
+                                                         prompt_token=flow_prompt_speech_token,
+                                                         prompt_feat=prompt_speech_feat,
+                                                         embedding=flow_embedding,
+                                                         uuid=this_uuid,
+                                                         finalize=False)
+                        yield {'tts_speech': this_tts_speech.cpu()}
+                        with self.lock:
+                            # 조정된 길이만큼 제거
+                            self.tts_speech_token_dict[this_uuid] = self.tts_speech_token_dict[this_uuid][adjusted_hop_len:]
 
-                    # LLM 스레드가 종료되었고, 모든 토큰을 처리했으면 루프 탈출
-                    if self.llm_end_dict[this_uuid] is True and current_tokens_len == processed_tokens_len:
+                            # 공백 경계도 조정 (이미 처리된 토큰 제거)
+                            if this_uuid in self.space_boundaries_dict:
+                                self.space_boundaries_dict[this_uuid] = {
+                                    pos - adjusted_hop_len for pos in self.space_boundaries_dict[this_uuid]
+                                    if pos > adjusted_hop_len
+                                }
+
+                        chunk_count += 1
+
+                        # 점진적으로 청크 크기 증가: 첫 청크 작게, 이후 점점 크게
+                        if chunk_count == 1:
+                            token_hop_len = 4 * self.flow.input_frame_rate  # 2번째: 2배
+                        elif chunk_count == 2:
+                            token_hop_len = 6 * self.flow.input_frame_rate  # 3번째: 3배
+                        else:
+                            # 4번째부터는 최대 크기로 증가
+                            token_hop_len = min(self.token_max_hop_len, int(token_hop_len * self.stream_scale_factor))
+
+                    if self.llm_end_dict[this_uuid] is True and len(self.tts_speech_token_dict[this_uuid]) < token_hop_len + self.token_overlap_len:
                         break
                 p.join()
+                # deal with remain tokens, make sure inference remain token len equals token_hop_len when cache_speech is not None
+                this_tts_speech_token = torch.tensor(self.tts_speech_token_dict[this_uuid]).unsqueeze(dim=0)
+                this_tts_speech = self.token2wav(token=this_tts_speech_token,
+                                                 prompt_token=flow_prompt_speech_token,
+                                                 prompt_feat=prompt_speech_feat,
+                                                 embedding=flow_embedding,
+                                                 uuid=this_uuid,
+                                                 finalize=True)
+                yield {'tts_speech': this_tts_speech.cpu()}
             # ================================================================
             # 비스트리밍 로직은 기존과 동일
             # ================================================================
@@ -448,6 +537,7 @@ class CosyVoiceModel:
                 self.mel_overlap_dict.pop(this_uuid)
                 self.hift_cache_dict.pop(this_uuid)
                 self.flow_cache_dict.pop(this_uuid)
+                self.space_boundaries_dict.pop(this_uuid, None)  # 공백 경계 정리
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
                 torch.cuda.current_stream().synchronize()
@@ -468,11 +558,11 @@ class CosyVoice2Model(CosyVoiceModel):
             self.llm.half()
             self.flow.half()
         # NOTE must matching training static_chunk_size
-        self.token_hop_len = 15 # 15 for CosyVoice2-0.5B, 10 for CosyVoice2-3B
-        
+        self.token_hop_len = 45 # 45 for larger chunks (3x increase from 15)
+
         # --- [수정] Greedy 정책을 위한 최대 홉 개수 설정 ---
-        # 한 번에 최대 3개 홉(hop)까지 처리 (더 "시원하게")
-        self.token_max_hop_count = 3
+        # 한 번에 최대 9개 홉(hop)까지 처리 (3x increase for 2-3x larger chunks)
+        self.token_max_hop_count = 9
         # --- [끝] ---
         
         # hift cache
@@ -487,6 +577,7 @@ class CosyVoice2Model(CosyVoiceModel):
         self.tts_speech_token_dict = {}
         self.llm_end_dict = {}
         self.hift_cache_dict = {}
+        self.space_boundaries_dict = {}  # 세션별 공백 위치 (자연스러운 구간 끊김을 위함)
 
     def load_jit(self, flow_encoder_model):
         flow_encoder = torch.jit.load(flow_encoder_model, map_location=self.device)
@@ -551,6 +642,7 @@ class CosyVoice2Model(CosyVoiceModel):
         with self.lock:
             self.tts_speech_token_dict[this_uuid], self.llm_end_dict[this_uuid] = [], False
             self.hift_cache_dict[this_uuid] = None
+            self.space_boundaries_dict[this_uuid] = set()  # 공백 경계 초기화
         if source_speech_token.shape[1] == 0:
             p = threading.Thread(target=self.llm_job, args=(text, prompt_text, llm_prompt_speech_token, llm_embedding, this_uuid))
         else:
@@ -558,62 +650,73 @@ class CosyVoice2Model(CosyVoiceModel):
         p.start()
         
         # ================================================================
-        # [핵심 수정] CosyVoice2Model을 위한 "탐욕적(Greedy) 청킹" 정책
+        # [적응형 청킹] CosyVoice2Model - 빠른 시작 + 점진적으로 큰 청크
         # ================================================================
         if stream is True:
             token_offset = 0
-            prompt_token_pad = int(np.ceil(flow_prompt_speech_token.shape[1] / self.token_hop_len) * self.token_hop_len - flow_prompt_speech_token.shape[1])
-            
+            chunk_count = 0
+
+            # 동적으로 조정되는 파라미터들
+            current_token_hop_len = 15  # 첫 청크는 작게 시작
+            current_max_hop_count = 1   # 첫 청크는 1개 홉만 처리
+
+            prompt_token_pad = int(np.ceil(flow_prompt_speech_token.shape[1] / current_token_hop_len) * current_token_hop_len - flow_prompt_speech_token.shape[1])
+
             while True:
-                # 0.05초마다 버퍼 확인
-                time.sleep(0.05)
-                
+                # 첫 몇 청크는 짧은 간격으로 체크 (빠른 응답)
+                if chunk_count < 3:
+                    time.sleep(0.05)  # 첫 3개 청크: 빠른 체크
+                else:
+                    time.sleep(0.15)  # 이후: 더 많은 토큰 축적
+
                 with self.lock:
                     current_total_len = len(self.tts_speech_token_dict[this_uuid])
                 llm_is_done = self.llm_end_dict[this_uuid]
 
                 # --- 1. 변수 계산 ---
-                base_hop_len = self.token_hop_len + prompt_token_pad if token_offset == 0 else self.token_hop_len
+                base_hop_len = current_token_hop_len + prompt_token_pad if token_offset == 0 else current_token_hop_len
                 available_len = current_total_len - token_offset
 
                 # [필수 조건] 1개 홉 처리에 '최소'로 필요한 토큰 수
-                # 이 조건이 충족되어야만 flow 모델이 lookahead를 수행할 수 있습니다.
                 min_required_len = base_hop_len + self.flow.pre_lookahead_len
-                
+
                 hops_to_process = 0
 
-                # --- 2. Greedy 정책 적용 (조건 느슨하게) ---
-                
-                # '최소' 조건만 충족하면
+                # --- 2. 적응형 Greedy 정책 ---
                 if available_len >= min_required_len:
-                    # 현재 버퍼에서 처리 가능한 *모든* 홉을 계산
-                    
-                    # (1) 첫 홉(base_hop) 이후 남은 토큰
+                    # 현재 버퍼에서 처리 가능한 홉 계산
                     available_for_extra_hops = available_len - min_required_len
-                    # (2) 남은 토큰으로 몇 개의 추가 홉을 만들 수 있는지 계산
-                    extra_hops = available_for_extra_hops // self.token_hop_len
-                    
-                    # (3) 처리할 총 홉 = 1 (기본) + 추가 홉
+                    extra_hops = available_for_extra_hops // current_token_hop_len
                     hops_to_process = 1 + extra_hops
-                    
-                    # (4) 안정성을 위해 최대 홉 개수 제한
-                    hops_to_process = min(hops_to_process, self.token_max_hop_count)
-                
+
+                    # 동적으로 조정되는 최대 홉 개수 제한
+                    hops_to_process = min(hops_to_process, current_max_hop_count)
+
                 # --- 3. 종료 조건 ---
-                # LLM이 끝났고, 버퍼에 남은 토큰이 '최소' 조건도 충족 못하면 종료
                 if llm_is_done and available_len < min_required_len:
                     break
 
                 # --- 4. 오디오 청크 처리 ---
                 if hops_to_process > 0:
-                    # 이번에 처리할 총 홉 길이 (토큰 수)
-                    total_hop_len_to_process = base_hop_len + (hops_to_process - 1) * self.token_hop_len
-                    # 모델에 전달할 총 토큰 길이 (lookahead 포함)
-                    total_tokens_to_pass = token_offset + total_hop_len_to_process + self.flow.pre_lookahead_len
+                    total_hop_len_to_process = base_hop_len + (hops_to_process - 1) * current_token_hop_len
+
+                    # [공백 경계 탐색] 자연스러운 끊김을 위해 공백 위치에서 자르기
+                    target_cut_point = token_offset + total_hop_len_to_process
+                    adjusted_cut_point = self.find_nearest_space_boundary(target_cut_point, this_uuid, search_range=150)
+
+                    # 조정된 위치가 너무 작으면 (최소 절반 이상은 유지) 원래 위치 사용
+                    if adjusted_cut_point < target_cut_point * 0.5:
+                        adjusted_cut_point = target_cut_point
+
+                    adjusted_hop_len = adjusted_cut_point - token_offset
+
+                    logging.info(f"[CHUNK-V2] uuid={this_uuid} | chunk={chunk_count+1} | original_hop={total_hop_len_to_process} | adjusted_hop={adjusted_hop_len}")
+
+                    total_tokens_to_pass = token_offset + adjusted_hop_len + self.flow.pre_lookahead_len
 
                     with self.lock:
                         this_tts_speech_token = torch.tensor(self.tts_speech_token_dict[this_uuid][:total_tokens_to_pass]).unsqueeze(dim=0)
-                    
+
                     this_tts_speech = self.token2wav(token=this_tts_speech_token,
                                                      prompt_token=flow_prompt_speech_token,
                                                      prompt_feat=prompt_speech_feat,
@@ -621,10 +724,22 @@ class CosyVoice2Model(CosyVoiceModel):
                                                      token_offset=token_offset,
                                                      uuid=this_uuid,
                                                      stream=stream,
-                                                     finalize=False) # [중요] "내부에서 붙이기"
-                    
-                    token_offset += total_hop_len_to_process
-                    
+                                                     finalize=False)
+
+                    token_offset += adjusted_hop_len
+                    chunk_count += 1
+
+                    # --- 5. 점진적으로 파라미터 증가 ---
+                    if chunk_count == 1:
+                        current_token_hop_len = 25  # 2번째: 약 1.7배
+                        current_max_hop_count = 2   # 최대 2개 홉
+                    elif chunk_count == 2:
+                        current_token_hop_len = 35  # 3번째: 약 2.3배
+                        current_max_hop_count = 3   # 최대 3개 홉
+                    elif chunk_count >= 3:
+                        current_token_hop_len = 45  # 4번째부터: 최대 크기
+                        current_max_hop_count = 9   # 최대 9개 홉
+
                     if this_tts_speech.numel() > 0:
                         yield {'tts_speech': this_tts_speech.cpu()}
             
@@ -669,6 +784,7 @@ class CosyVoice2Model(CosyVoiceModel):
             self.tts_speech_token_dict.pop(this_uuid)
             self.llm_end_dict.pop(this_uuid)
             self.hift_cache_dict.pop(this_uuid)
+            self.space_boundaries_dict.pop(this_uuid, None)  # 공백 경계 정리
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             torch.cuda.current_stream().synchronize()
