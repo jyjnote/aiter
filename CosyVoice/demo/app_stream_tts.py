@@ -41,6 +41,7 @@ app = Flask(__name__)
 CORS(app) 
 
 SAVE_ACCUMULATED_AUDIO = True
+SPACE_THRESHOLD = 2  # 공백 2개마다 합성
 
 OUTPUT_DIR = os.path.join(PROJ_DIR, "outputs")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -73,6 +74,8 @@ class Session:
     worker_thread: Optional[threading.Thread] = None
     stop_event: threading.Event = field(default_factory=threading.Event)
     accumulated_audio: List[torch.Tensor] = field(default_factory=list)
+    accumulated_text: str = ""  # 누적된 텍스트
+    space_count: int = 0  # 공백 카운트
 
 SESSIONS: Dict[str, Session] = {}
 SESS_LOCK = threading.Lock()
@@ -83,142 +86,120 @@ def get_or_create_session(sid: str) -> Session:
         if sess is None:
             sess = Session(sid=sid)
             SESSIONS[sid] = sess
-            t = threading.Thread(target=tts_worker, args=(sess,), daemon=True)
+            t = threading.Thread(target=tts_worker_v2, args=(sess,), daemon=True)
             t.start()
             sess.worker_thread = t
     return sess
 
 # ==============================
-# 3) TTS Worker & Synthesizer [하이브리드 버전]
+# 3) TTS Worker - Stream=False Version
 # ==============================
-def tts_worker(sess: Session):
-    print(f"[{sess.sid}] TTS worker started. Waiting for first text chunk...")
+def tts_worker_v2(sess: Session):
+    """
+    공백 2개마다 텍스트를 누적한 후 stream=False로 한 번에 합성
+    """
+    print(f"[{sess.sid}] TTS worker v2 started (stream=False mode)")
 
     while not sess.stop_event.is_set():
-        
         try:
-            first_chunk = sess.text_stream_q.get(timeout=1.0) 
+            chunk = sess.text_stream_q.get(timeout=1.0)
         except queue.Empty:
-            continue 
+            continue
 
-        if first_chunk is None:
-            logging.info(f"[{sess.sid}] Got 'None' as first chunk. Sending 'end'.")
+        if chunk is None:
+            # EOS marker - 누적된 텍스트 모두 합성
+            if sess.accumulated_text.strip():
+                synthesize_accumulated_text(sess)
             sess.sse_q.put(json.dumps({"type": "end"}))
-            continue 
+            # 세션 리셋
+            sess.accumulated_text = ""
+            sess.space_count = 0
+            continue
         
-        logging.info(f"[{sess.sid}] First chunk received. Starting inference run.")
-        text_for_this_run = first_chunk 
-
-        if SAVE_ACCUMULATED_AUDIO:
-            sess.accumulated_audio.clear()
-
-        def text_generator() -> Generator[str, None, None]:
-            nonlocal text_for_this_run
-            
-            logging.info(f"[{sess.sid}] Yielding first chunk: '{first_chunk.strip()}'")
-            yield first_chunk
-            
-            buffer = "" 
-            while not sess.stop_event.is_set():
-                try:
-                    chunk = sess.text_stream_q.get(timeout=0.1) 
-                    
-                    if chunk is None:
-                        if buffer:
-                            logging.info(f"[{sess.sid}] EOS marker. Flushing buffer: '{buffer}'")
-                            text_for_this_run += buffer 
-                            yield buffer
-                            buffer = ""
-                        logging.info(f"[{sess.sid}] EOS marker received. Terminating text generator.")
-                        break 
-                    
-                    else:
-                        buffer += chunk
-                        
-                        last_space_index = buffer.rfind(' ')
-                        if last_space_index != -1:
-                            to_yield = buffer[:last_space_index + 1]
-                            buffer = buffer[last_space_index + 1:]
-                            
-                            text_for_this_run += to_yield
-                            
-                            logging.info(f"[{sess.sid}] Yielding by space: '{to_yield.strip()}' | Remaining in buffer: '{buffer.strip()}'")
-                            yield to_yield
-                                
-                except queue.Empty:
-                    continue
-            
-            if buffer:
-                logging.warning(f"[{sess.sid}] Text generator exited loop unexpectedly. Final flush: '{buffer}'")
-                text_for_this_run += buffer 
-                yield buffer
-            
-            logging.info(f"[{sess.sid}] Text generator finished.")
-
-
-        use_frontend = True 
-        logging.info(f"[{sess.sid}] Starting new TTS inference loop. Using Text Frontend: {use_frontend}")
+        # 텍스트 누적
+        sess.accumulated_text += chunk
+        sess.space_count += chunk.count(' ')
         
-        try:
-            for out in cosyvoice.inference_instruct2(
-                    tts_text=text_generator(), 
-                    instruct_text="",
-                    prompt_speech_16k=prompt_speech_16k,
-                    zero_shot_spk_id="",
-                    stream=True,
-                    speed=1.0,
-                    text_frontend=use_frontend 
-            ):
-                audio_chunk = out["tts_speech"].cpu()
-                
-                if SAVE_ACCUMULATED_AUDIO:
-                    sess.accumulated_audio.append(audio_chunk)
-
-                if audio_chunk.numel() > 0:
-                    buf = io.BytesIO()
-                    torchaudio.save(buf, audio_chunk, SAMPLE_RATE, format="wav")
-                    buf.seek(0)
-                    wav_chunk_bytes = buf.read()
-                    b64 = base64.b64encode(wav_chunk_bytes).decode("utf-8")
-                    sess.sse_q.put(json.dumps({"type": "streaming_audio", "b64wav": b64}))
-
-        except Exception as e:
-            logging.error(f"[{sess.sid}] TTS (instruct2) Error: {e}", exc_info=True)
-            sess.sse_q.put(json.dumps({"type": "log", "msg": f"TTS error: {e}"}))
-
-        if SAVE_ACCUMULATED_AUDIO and sess.accumulated_audio and text_for_this_run.strip():
-            try:
-                final_audio = torch.cat(sess.accumulated_audio, dim=1)
-                save_filename = f"session_audio_{sess.sid}_{int(time.time())}.wav" 
-                save_path = os.path.join(OUTPUT_DIR, save_filename)
-                
-                torchaudio.save(save_path, final_audio, SAMPLE_RATE, format="wav")
-                logging.info(f"[{sess.sid}] ✅ Accumulated audio saved successfully to: {save_path}")
-
-                file_url = f"/outputs/{save_filename}"
-                
-                # --- [로그 추가] ---
-                # 최종적으로 전송되는 텍스트가 무엇인지 로그로 확인
-                final_text = text_for_this_run.strip()
-                logging.info(f"[{sess.sid}] SENDING 'final_audio' with TEXT: '{final_text}'")
-                # --- [로그 추가 끝] ---
-                
-                sess.sse_q.put(json.dumps({
-                    "type": "final_audio",
-                    "url": file_url,
-                    "text": final_text
-                }))
-
-            except Exception as e:
-                logging.error(f"[{sess.sid}] ❌ Failed to save accumulated audio: {e}")
-            finally:
-                sess.accumulated_audio.clear()
+        logging.info(f"[{sess.sid}] Accumulated: '{sess.accumulated_text.strip()}' (spaces: {sess.space_count})")
         
-        sess.sse_q.put(json.dumps({"type": "end"}))
-        logging.info(f"[{sess.sid}] Inference run finished. Waiting for next text chunk...")
+        # 공백 THRESHOLD 도달 시 합성
+        if sess.space_count >= SPACE_THRESHOLD:
+            # 마지막 공백까지만 합성
+            last_space_idx = sess.accumulated_text.rfind(' ')
+            if last_space_idx != -1:
+                text_to_synthesize = sess.accumulated_text[:last_space_idx + 1]  # 공백 포함
+                remaining = sess.accumulated_text[last_space_idx + 1:]
+                
+                # 합성 수행
+                synthesize_text_chunk(sess, text_to_synthesize)
+                
+                # 리셋
+                sess.accumulated_text = remaining
+                sess.space_count = remaining.count(' ')
+
+def synthesize_text_chunk(sess: Session, text: str):
+    """
+    주어진 텍스트를 stream=False로 합성하고 결과 전송
+    """
+    if not text.strip():
+        return
     
-    print(f"[{sess.sid}] TTS worker fully stopped.")
+    # 띄어쓰기로 끝나도록 보장
+    if not text.endswith(' '):
+        text += ' '
+    
+    logging.info(f"[{sess.sid}] Synthesizing chunk (stream=False): '{text.strip()}'")
+    
+    try:
+        # stream=False로 한 번에 합성
+        result = None
+        for out in cosyvoice.inference_instruct2(
+                tts_text=text,
+                instruct_text="",
+                prompt_speech_16k=prompt_speech_16k,
+                zero_shot_spk_id="",
+                stream=False,  # 핵심: stream=False
+                speed=1.0,
+                text_frontend=True
+        ):
+            result = out
+            break  # stream=False이므로 한 번만 실행됨
+        
+        if result:
+            audio_chunk = result["tts_speech"].cpu()
+            
+            # 오디오 저장 및 전송
+            buf = io.BytesIO()
+            torchaudio.save(buf, audio_chunk, SAMPLE_RATE, format="wav")
+            buf.seek(0)
+            wav_chunk_bytes = buf.read()
+            b64 = base64.b64encode(wav_chunk_bytes).decode("utf-8")
+            
+            # 청크 전송
+            sess.sse_q.put(json.dumps({
+                "type": "streaming_audio",  # 클라이언트와 호환되도록 변경
+                "b64wav": b64,
+                "text": text.strip()
+            }))
+            
+            logging.info(f"[{sess.sid}] Audio chunk sent for: '{text.strip()}'")
+            
+    except Exception as e:
+        logging.error(f"[{sess.sid}] TTS Error: {e}", exc_info=True)
+        sess.sse_q.put(json.dumps({"type": "log", "msg": f"TTS error: {e}"}))
 
+def synthesize_accumulated_text(sess: Session):
+    """
+    세션에 누적된 모든 텍스트를 합성
+    """
+    if not sess.accumulated_text.strip():
+        return
+    
+    text = sess.accumulated_text
+    if not text.endswith(' '):
+        text += ' '
+    
+    synthesize_text_chunk(sess, text)
 
 # ==============================
 # 4) HTTP Routes
@@ -242,11 +223,7 @@ def type_event():
 
     sess = get_or_create_session(sid)
     
-    new_text_chunk = None
-    
-    # --- [로그 추가] ---
-    logging.info(f"[{sid}] /type received. len(text)={len(text)}, sess.last_sent_len={sess.last_sent_len}")
-    # --- [로그 추가 끝] ---
+    logging.info(f"[{sid}] /type received. len(text)={len(text)}, sess.last_sent_len={sess.last_sent_len}, force={force}")
     
     if len(text) > sess.last_sent_len:
         new_text_chunk = text[sess.last_sent_len:]
@@ -257,11 +234,7 @@ def type_event():
     if force:
         logging.info(f"[{sid}] Force flush requested. Queueing EOS marker (None).")
         sess.text_stream_q.put(None)
-        
-        # --- [핵심 버그 수정] ---
-        # 이 라인이 "합니다합니다" 중복 버그의 원인입니다. 주석 처리합니다.
-        # sess.last_sent_len = 0 
-        # --- [수정 끝] ---
+        # 리셋하지 않음 (중복 방지)
 
     return jsonify({"ok": True})
 

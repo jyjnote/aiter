@@ -2,7 +2,7 @@
 <html lang="ko">
 <head>
   <meta charset="utf-8" />
-  <title>Streaming TTS (Hybrid Strategy)</title>
+  <title>Streaming TTS (Fixed)</title>
   
   <style>
     body {
@@ -133,7 +133,7 @@
 <body>
 
   <div class="container">
-    <h1>Streaming TTS (Hybrid Strategy)</h1>
+    <h1>Streaming TTS (Fixed)</h1>
     <p>실시간으로 음성이 재생되며, 문장 끝에서 플레이어가 생성됩니다.</p>
     
     <textarea id="ta" placeholder="여기에 문장을 입력하세요."></textarea>
@@ -176,6 +176,7 @@
   const audioContext = new (window.AudioContext || window.webkitAudioContext)();
   let streamingDuration = 0; 
   let isWaitingForFinal = false; 
+  let currentText = "";  // 현재 입력 중인 텍스트 추적
 
   function addLog(message) {
     console.log(message);
@@ -268,45 +269,38 @@
     try {
       const msg = JSON.parse(e.data);
 
-      if (isWaitingForFinal) {
-        if (msg.type === 'streaming_audio') {
-          addLog("[WAITING] 스트리밍 청크 무시함.");
-          return; 
-        }
-        if (msg.type === 'final_audio') {
-          addLog(`✅ [WAITING] 최종 파일 수신: ${msg.text}`);
-          isWaitingForFinal = false; 
-          displayFinalAudio(msg);
-          return; 
-        }
-        if (msg.type === 'end') {
-          addLog("🏁 [WAITING] End 메시지 수신.");
-          isWaitingForFinal = false; 
-          fakePlayerContainer.style.display = 'none';
-          streamingDuration = 0;
-          return; 
-        }
-        if (msg.type === 'log') {
-          addLog(`[SERVER LOG] ${msg.msg}`);
-        }
-        return; 
-      }
-
+      // 핵심 수정: waiting 상태와 관계없이 streaming_audio는 항상 처리
       if (msg.type === 'streaming_audio' && msg.b64wav) {
+        addLog("[AUDIO] 스트리밍 청크 수신 및 재생");
         fakePlayerContainer.style.display = 'block';
+        fakePlayerText.textContent = `"${currentText}"`;  // 현재 텍스트 표시
         playStreamingChunk(msg.b64wav);
+        // waiting 상태여도 스트리밍은 계속 처리
+        return;
+      }
       
-      } else if (msg.type === 'final_audio') {
-        addLog(`[!] (경고) 대기 상태가 아닐 때 final_audio 수신: ${msg.text}`);
+      if (msg.type === 'final_audio') {
+        addLog(`✅ 최종 파일 수신: ${msg.text}`);
+        isWaitingForFinal = false; 
         displayFinalAudio(msg);
-
-      } else if (msg.type === 'log') {
-        addLog(`[SERVER LOG] ${msg.msg}`);
+        return;
+      }
       
-      } else if (msg.type === 'end') {
+      if (msg.type === 'end') {
         addLog("🏁 TTS 문장 작업 완료.");
+        isWaitingForFinal = false; 
         fakePlayerContainer.style.display = 'none';
         streamingDuration = 0;
+        
+        // 문장 완료 후 입력창 초기화
+        ta.value = '';
+        currentText = '';
+        return;
+      }
+      
+      if (msg.type === 'log') {
+        addLog(`[SERVER LOG] ${msg.msg}`);
+        return;
       }
 
     } catch (err) {
@@ -321,6 +315,7 @@
 
   function sendText(force=false) {
     const text = ta.value;
+    currentText = text;  // 현재 텍스트 저장
     
     if (force && !text) { 
         addLog("텍스트 없이 문장 전송(.) 시도. 무시함.");
@@ -336,15 +331,13 @@
     fakePlayerText.textContent = `"${text}"`;
     
     if (force) {
-      // [수정] 입력창을 비우지 않음 (중복 입력 현상 방지)
-      // ta.value = ''; 
-      
-      q.length = 0; 
+      // 구두점 입력 시에도 큐를 비우지 않음 (오디오는 계속 재생)
+      // q.length = 0;  // 제거
       isWaitingForFinal = true; 
     }
   }
 
-  // --- 4. 입력 이벤트 핸들러 [핵심 수정] ---
+  // 입력 이벤트 핸들러
   let isComposing = false;
   const punctuationRegex = /[.,?!]$/; 
 
@@ -353,15 +346,12 @@
     isComposing = true;
   });
 
-  // [핵심 버그 수정] 'compositionend'는 'isComposing' 플래그만 변경
   ta.addEventListener('compositionend', (e) => {
     isComposing = false;
     addLog("[INPUT] 한글 조합 완료.");
-    // [수정] handleInput(e) 호출을 여기서 삭제 (중복 호출 방지)
   });
 
   function handleInput(e) {
-    // [로그 추가] 이벤트 타입을 로그로 남김
     addLog(`[INPUT] 이벤트 발생 (Type: ${e.type}) | 조합 중: ${isComposing}`);
     
     if (isComposing) {
