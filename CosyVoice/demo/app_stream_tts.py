@@ -41,7 +41,9 @@ app = Flask(__name__)
 CORS(app) 
 
 SAVE_ACCUMULATED_AUDIO = True
-SPACE_THRESHOLD = 2  # 공백 2개마다 합성
+# [수정] 1. 동적 임계값 변수 선언
+SPACE_THRESHOLD_FIRST = 1     # 첫 청크는 공백 1개 (빠른 반응, 딜레이 감수)
+SPACE_THRESHOLD_SUBSEQUENT = 4  # 이후 청크는 공백 4개 (더 큰 청크로 버퍼링 시간 확보)
 
 OUTPUT_DIR = os.path.join(PROJ_DIR, "outputs")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -56,7 +58,9 @@ if not os.path.isfile(PROMPT_WAV):
     raise FileNotFoundError(f"{PROMPT_WAV} not found!")
 
 print("서버 시작: CosyVoice2 로드…")
-cosyvoice = CosyVoice2(model_dir=MODEL_DIR, fp16=False)
+# vLLM 및 FP16을 사용하려면 아래 주석을 해제하세요.
+# cosyvoice = CosyVoice2(model_dir=MODEL_DIR, fp16=True, load_vllm=True)
+cosyvoice = CosyVoice2(model_dir=MODEL_DIR, fp16=False) # 기본 로드
 prompt_speech_16k = load_wav(PROMPT_WAV, 16000)
 print("모델 로드 완료.")
 
@@ -65,6 +69,7 @@ SAMPLE_RATE = cosyvoice.sample_rate
 # ==============================
 # 1) Session Management
 # ==============================
+# [수정] 2. Session Dataclass에 상태 변수 추가
 @dataclass
 class Session:
     sid: str
@@ -76,6 +81,8 @@ class Session:
     accumulated_audio: List[torch.Tensor] = field(default_factory=list)
     accumulated_text: str = ""  # 누적된 텍스트
     space_count: int = 0  # 공백 카운트
+    is_first_chunk: bool = True  # 첫 번째 청크인지 추적
+    current_threshold: int = field(default=SPACE_THRESHOLD_FIRST) # 현재 적용할 임계값
 
 SESSIONS: Dict[str, Session] = {}
 SESS_LOCK = threading.Lock()
@@ -94,11 +101,12 @@ def get_or_create_session(sid: str) -> Session:
 # ==============================
 # 3) TTS Worker - Stream=False Version
 # ==============================
+# [수정] 3. tts_worker_v2 로직 수정
 def tts_worker_v2(sess: Session):
     """
-    공백 2개마다 텍스트를 누적한 후 stream=False로 한 번에 합성
+    동적 임계값을 사용하여 텍스트를 누적한 후 stream=False로 한 번에 합성
     """
-    print(f"[{sess.sid}] TTS worker v2 started (stream=False mode)")
+    print(f"[{sess.sid}] TTS worker v2 started (stream=False mode, dynamic threshold)")
 
     while not sess.stop_event.is_set():
         try:
@@ -111,19 +119,23 @@ def tts_worker_v2(sess: Session):
             if sess.accumulated_text.strip():
                 synthesize_accumulated_text(sess)
             sess.sse_q.put(json.dumps({"type": "end"}))
-            # 세션 리셋
+            # 세션 리셋 시, 상태 변수도 모두 초기화
             sess.accumulated_text = ""
             sess.space_count = 0
+            sess.is_first_chunk = True
+            sess.current_threshold = SPACE_THRESHOLD_FIRST # 초기 임계값으로 복원
+            sess.last_sent_len = 0
             continue
         
         # 텍스트 누적
         sess.accumulated_text += chunk
         sess.space_count += chunk.count(' ')
         
-        logging.info(f"[{sess.sid}] Accumulated: '{sess.accumulated_text.strip()}' (spaces: {sess.space_count})")
+        # 로그에 현재 임계값 표시
+        logging.info(f"[{sess.sid}] Accumulated: '{sess.accumulated_text.strip()}' (spaces: {sess.space_count} / threshold: {sess.current_threshold})")
         
-        # 공백 THRESHOLD 도달 시 합성
-        if sess.space_count >= SPACE_THRESHOLD:
+        # 동적 THRESHOLD 도달 시 합성
+        if sess.space_count >= sess.current_threshold:
             # 마지막 공백까지만 합성
             last_space_idx = sess.accumulated_text.rfind(' ')
             if last_space_idx != -1:
@@ -136,6 +148,15 @@ def tts_worker_v2(sess: Session):
                 # 리셋
                 sess.accumulated_text = remaining
                 sess.space_count = remaining.count(' ')
+
+                # [핵심 로직]
+                # 첫 번째 청크를 성공적으로 보냈다면,
+                # 다음 임계값을 '더 크게' 변경하여 버퍼링 전략을 활성화합니다.
+                if sess.is_first_chunk:
+                    sess.is_first_chunk = False
+                    sess.current_threshold = SPACE_THRESHOLD_SUBSEQUENT
+                    logging.info(f"[{sess.sid}] First chunk sent. New threshold set to: {sess.current_threshold}")
+
 
 def synthesize_text_chunk(sess: Session, text: str):
     """
@@ -190,7 +211,7 @@ def synthesize_text_chunk(sess: Session, text: str):
 
 def synthesize_accumulated_text(sess: Session):
     """
-    세션에 누적된 모든 텍스트를 합성
+    세션에 누적된 모든 텍스트를 합성 (EOS 마커 수신 시 호출)
     """
     if not sess.accumulated_text.strip():
         return
@@ -234,7 +255,7 @@ def type_event():
     if force:
         logging.info(f"[{sid}] Force flush requested. Queueing EOS marker (None).")
         sess.text_stream_q.put(None)
-        # 리셋하지 않음 (중복 방지)
+        # 리셋은 워커 스레드가 담당
 
     return jsonify({"ok": True})
 
