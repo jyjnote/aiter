@@ -445,43 +445,79 @@ class CosyVoice2Model(CosyVoiceModel):
                                              streaming=stream,
                                              finalize=finalize)
         tts_mel = tts_mel[:, :, token_offset * self.flow.token_mel_ratio:]
-        # append hift cache
+        
+        # 1. 캐시 읽기 (수정 필요 없음)
         if self.hift_cache_dict[uuid] is not None:
             hift_cache_mel, hift_cache_source = self.hift_cache_dict[uuid]['mel'], self.hift_cache_dict[uuid]['source']
             tts_mel = torch.concat([hift_cache_mel, tts_mel], dim=2)
         else:
             hift_cache_source = torch.zeros(1, 1, 0)
-        # keep overlap mel and hift cache
+            
+        # 2. 캐시 쓰기 또는 파이널라이즈
         if finalize is False:
+            # [컨텍스트 유지]
+            # (누적 공백 2회 시 이 블록이 실행됨)
+            # 오디오 생성
             tts_speech, tts_source = self.hift.inference(speech_feat=tts_mel, cache_source=hift_cache_source)
             if self.hift_cache_dict[uuid] is not None:
-                # [핵심] 여기가 "내부에서 붙이는" 로직입니다.
+                # 이전 캐시와 이어붙임
                 tts_speech = fade_in_out(tts_speech, self.hift_cache_dict[uuid]['speech'], self.speech_window)
+            
+            # [중요] 다음 배치를 위해 캐시 업데이트
             self.hift_cache_dict[uuid] = {'mel': tts_mel[:, :, -self.mel_cache_len:],
                                           'source': tts_source[:, :, -self.source_cache_len:],
                                           'speech': tts_speech[:, -self.source_cache_len:]}
+            # 캐시 부분을 제외하고 반환
             tts_speech = tts_speech[:, :-self.source_cache_len]
         else:
+            # [컨텍스트 종료]
+            # (구두점 입력 시 이 블록이 실행됨)
             if speed != 1.0:
                 assert self.hift_cache_dict[uuid] is None, 'speed change only support non-stream inference mode'
                 tts_mel = F.interpolate(tts_mel, size=int(tts_mel.shape[2] / speed), mode='linear')
+            
+            # 오디오 생성
             tts_speech, tts_source = self.hift.inference(speech_feat=tts_mel, cache_source=hift_cache_source)
             if self.hift_cache_dict[uuid] is not None:
-                # [핵심] 마지막 조각도 "내부에서 붙입니다."
+                # 이전 캐시와 이어붙임
                 tts_speech = fade_in_out(tts_speech, self.hift_cache_dict[uuid]['speech'], self.speech_window)
+            
+            # [중요] 캐시를 업데이트하지 않고 전체 오디오 반환
         return tts_speech
 
     def tts(self, text=torch.zeros(1, 0, dtype=torch.int32), flow_embedding=torch.zeros(0, 192), llm_embedding=torch.zeros(0, 192),
                 prompt_text=torch.zeros(1, 0, dtype=torch.int32),
                 llm_prompt_speech_token=torch.zeros(1, 0, dtype=torch.int32),
                 flow_prompt_speech_token=torch.zeros(1, 0, dtype=torch.int32),
-                prompt_speech_feat=torch.zeros(1, 0, 80), source_speech_token=torch.zeros(1, 0, dtype=torch.int32), stream=False, speed=1.0, **kwargs):
+                prompt_speech_feat=torch.zeros(1, 0, 80), source_speech_token=torch.zeros(1, 0, dtype=torch.int32), 
+                stream=False, speed=1.0, 
+                session_id=None, keep_context=True, # <--- [핵심] 파라미터 추가
+                **kwargs):
             
-            # 1. 세션 및 스레드 초기화 (기존과 동일)
-            this_uuid = str(uuid.uuid1())
+            # 1. 세션 ID 설정
+            if session_id is None:
+                this_uuid = str(uuid.uuid1())
+                logging.warning(f"No session_id provided. Using random uuid: {this_uuid}. Context will be lost.")
+            else:
+                this_uuid = session_id
+                logging.info(f"[{this_uuid}] Using session_id for caching.")
+
+            # 2. 캐시 및 스레드 초기화
             with self.lock:
-                self.tts_speech_token_dict[this_uuid], self.llm_end_dict[this_uuid] = [], False
-                self.hift_cache_dict[this_uuid] = None
+                # [수정] 세션이 존재하지 않을 때만 캐시를 초기화
+                if this_uuid not in self.tts_speech_token_dict:
+                    logging.info(f"[{this_uuid}] New session. Initializing caches.")
+                    self.tts_speech_token_dict[this_uuid] = []
+                    self.llm_end_dict[this_uuid] = False
+                    self.hift_cache_dict[this_uuid] = None
+                else:
+                    # 세션이 존재하면 (즉, 이전 배치가 있었으면)
+                    # 토큰 딕셔너리와 종료 플래그만 초기화
+                    logging.info(f"[{this_uuid}] Existing session. Re-using hift_cache. Resetting tokens.")
+                    self.tts_speech_token_dict[this_uuid] = []
+                    self.llm_end_dict[this_uuid] = False
+                    # self.hift_cache_dict[this_uuid]는 의도적으로 보존
+
             if source_speech_token.shape[1] == 0:
                 p = threading.Thread(target=self.llm_job, args=(text, prompt_text, llm_prompt_speech_token, llm_embedding, this_uuid))
             else:
@@ -489,50 +525,57 @@ class CosyVoice2Model(CosyVoiceModel):
             p.start()
             
             
-            # 2. [핵심 수정] "누적 2회 공백" 기반 일괄 처리 로직
-            # 'stream' 플래그 값과 관계없이, LLM 스레드가 완료될 때까지 기다립니다.
-            # LLM 스레드(llm_job)는 app_stream_tts.py의 text_generator가
-            # 'None' (누적 공백 2회)을 받을 때까지 실행됩니다.
-            
-            # LLM 스레드가 완료될 때까지(즉, 트리거가 발생할 때까지) 여기서 대기합니다.
+            # 3. "일괄 처리" 대기 (기존과 동일)
+            # LLM 스레드가 (None, keep_context) 신호를 받을 때까지 대기
             p.join() 
 
             logging.info(f"[{this_uuid}] LLM job finished. Consuming all accumulated tokens.")
 
-            # 3. 누적된 모든 토큰 가져오기
-            # LLM 스레드가 종료되었으므로, tts_speech_token_dict에 모든 토큰이 들어있음
+            # 4. 누적된 모든 토큰 가져오기 (기존과 동일)
             with self.lock:
                 all_tokens = self.tts_speech_token_dict[this_uuid]
             
-            # 4. 모든 토큰을 한 번에 오디오로 변환 (비스트리밍 방식)
+            # 5. [수정] 'finalize' 여부 결정
+            # keep_context=True (누적 공백 2회) -> is_final_batch=False (캐시 유지, 오디오 끝부분 자름)
+            # keep_context=False (구두점) -> is_final_batch=True (캐시 삭제, 오디오 전체 생성)
+            is_final_batch = not keep_context
+            
+            logging.info(f"[{this_uuid}] Batch type: {'FINAL' if is_final_batch else 'INTERIM (keeping context)'}")
+
+            # 6. 모든 토큰을 한 번에 오디오로 변환
             if not all_tokens:
                 logging.warning(f"[{this_uuid}] No speech tokens were generated. Yielding empty audio.")
                 this_tts_speech = torch.empty(1, 0)
             else:
-                logging.info(f"[{this_uuid}] Processing all {len(all_tokens)} tokens at once (finalize=True).")
+                logging.info(f"[{this_uuid}] Processing all {len(all_tokens)} tokens (finalize={is_final_batch}).")
                 this_tts_speech_token = torch.tensor(all_tokens).unsqueeze(dim=0)
                 
-                # 모든 토큰을 한 번에 token2wav로 전달
+                # [수정] token2wav 호출
                 this_tts_speech = self.token2wav(token=this_tts_speech_token,
                                                 prompt_token=flow_prompt_speech_token,
                                                 prompt_feat=prompt_speech_feat,
                                                 embedding=flow_embedding,
-                                                token_offset=0, # 처음부터 처리
+                                                token_offset=0,
                                                 uuid=this_uuid,
-                                                stream=False,   # 스트리밍 모드 아님
-                                                finalize=True, # 한 번에 처리
+                                                stream=True, # <--- [중요] 캐시를 읽고 쓰려면 True여야 함
+                                                finalize=is_final_batch, # <--- [중요] 동적으로 설정
                                                 speed=speed)
 
-            # 5. 최종 오디오 반환
+            # 7. 최종 오디오 반환
             yield {'tts_speech': this_tts_speech.cpu()}
             
-            # (기존의 if stream is True: ... else: ... 블록 전체가 위 로직으로 대체됨)
-
-            # 6. 세션 정리
+            # 8. [수정] 세션 정리
             with self.lock:
-                self.tts_speech_token_dict.pop(this_uuid)
-                self.llm_end_dict.pop(this_uuid)
-                self.hift_cache_dict.pop(this_uuid)
+                self.tts_speech_token_dict.pop(this_uuid, None)
+                self.llm_end_dict.pop(this_uuid, None)
+                
+                if is_final_batch:
+                    logging.info(f"[{this_uuid}] Final batch. Popping hift_cache.")
+                    self.hift_cache_dict.pop(this_uuid, None) # 캐시 삭제
+                else:
+                    logging.info(f"[{this_uuid}] Interim batch. Preserving hift_cache for next run.")
+                    # 캐시를 보존
+            
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
                 torch.cuda.current_stream().synchronize()
