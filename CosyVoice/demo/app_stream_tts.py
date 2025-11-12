@@ -73,6 +73,11 @@ class Session:
     worker_thread: Optional[threading.Thread] = None
     stop_event: threading.Event = field(default_factory=threading.Event)
     accumulated_audio: List[torch.Tensor] = field(default_factory=list)
+    
+    # --- [핵심 추가] ---
+    # 단일 공백 누적 횟수를 저장할 카운터
+    single_space_count: int = 0
+    # --- [추가 끝] ---
 
 SESSIONS: Dict[str, Session] = {}
 SESS_LOCK = threading.Lock()
@@ -233,37 +238,51 @@ def serve_output_file(filename):
 def index():
     return render_template("index.html") 
 
+# --- [핵심 수정] ---
 @app.route("/type", methods=["POST"])
 def type_event():
     data = request.get_json(force=True)
     sid = data.get("sid") or str(uuid.uuid4())
     text = data.get("text", "")
-    force = data.get("force", False)
+    force_from_client = data.get("force", False) # 클라이언트가 보낸 force (예: 구두점)
 
     sess = get_or_create_session(sid)
     
     new_text_chunk = None
-    
-    # --- [로그 추가] ---
-    logging.info(f"[{sid}] /type received. len(text)={len(text)}, sess.last_sent_len={sess.last_sent_len}")
-    # --- [로그 추가 끝] ---
+    force_from_server = False # 서버가 결정한 force (누적 공백)
     
     if len(text) > sess.last_sent_len:
         new_text_chunk = text[sess.last_sent_len:]
+        
+        # [v2] 새 청크가 공백으로 끝나고, 연속 공백이 아닌지 확인
+        if new_text_chunk.endswith(' ') and not new_text_chunk.endswith('  '):
+            sess.single_space_count += 1
+            logging.info(f"[{sid}] Single space detected. Count: {sess.single_space_count}")
+        # 공백이 아닌 다른 텍스트가 입력되면 카운터 초기화
+        elif not new_text_chunk.strip() == "":
+            logging.info(f"[{sid}] Non-space text detected. Resetting space count.")
+            sess.single_space_count = 0
+
         sess.text_stream_q.put(new_text_chunk)
         logging.info(f"[{sid}] Queued new text chunk: '{new_text_chunk.strip()}'")
         sess.last_sent_len = len(text)
     
-    if force:
-        logging.info(f"[{sid}] Force flush requested. Queueing EOS marker (None).")
+    # 서버 트리거 확인: 누적 공백 2회
+    if sess.single_space_count >= 2:
+        logging.info(f"[{sid}] TRIGGER HIT (2 cumulative spaces). Setting server_force=true.")
+        force_from_server = True
+        sess.single_space_count = 0 # 트리거 발동 후 카운터 초기화
+
+    # 클라이언트 또는 서버 둘 중 하나라도 'force'를 요청하면 EOS 마커 전송
+    if force_from_client or force_from_server:
+        logging.info(f"[{sid}] Force flush requested (Client: {force_from_client}, Server: {force_from_server}). Queueing EOS marker (None).")
         sess.text_stream_q.put(None)
         
-        # --- [핵심 버그 수정] ---
-        # 이 라인이 "합니다합니다" 중복 버그의 원인입니다. 주석 처리합니다.
+        # (중요) 버그 수정을 위해 last_sent_len은 여기서 초기화하지 않습니다.
         # sess.last_sent_len = 0 
-        # --- [수정 끝] ---
 
     return jsonify({"ok": True})
+# --- [수정 끝] ---
 
 @app.route("/sse_audio")
 def sse_audio():

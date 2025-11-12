@@ -298,76 +298,6 @@ class CosyVoiceModel:
                 tts_speech = fade_in_out(tts_speech, self.hift_cache_dict[uuid]['speech'], self.speech_window)
         return tts_speech
 
-    # def tts(self, text=torch.zeros(1, 0, dtype=torch.int32), flow_embedding=torch.zeros(0, 192), llm_embedding=torch.zeros(0, 192),
-    #         prompt_text=torch.zeros(1, 0, dtype=torch.int32),
-    #         llm_prompt_speech_token=torch.zeros(1, 0, dtype=torch.int32),
-    #         flow_prompt_speech_token=torch.zeros(1, 0, dtype=torch.int32),
-    #         prompt_speech_feat=torch.zeros(1, 0, 80), source_speech_token=torch.zeros(1, 0, dtype=torch.int32), stream=False, speed=1.0, **kwargs):
-    #     # this_uuid is used to track variables related to this inference thread
-    #     this_uuid = str(uuid.uuid1())
-    #     with self.lock:
-    #         self.tts_speech_token_dict[this_uuid], self.llm_end_dict[this_uuid] = [], False
-    #         self.hift_cache_dict[this_uuid] = None
-    #         self.mel_overlap_dict[this_uuid] = torch.zeros(1, 80, 0)
-    #         self.flow_cache_dict[this_uuid] = torch.zeros(1, 80, 0, 2)
-    #     if source_speech_token.shape[1] == 0:
-    #         p = threading.Thread(target=self.llm_job, args=(text, prompt_text, llm_prompt_speech_token, llm_embedding, this_uuid))
-    #     else:
-    #         p = threading.Thread(target=self.vc_job, args=(source_speech_token, this_uuid))
-    #     p.start()
-    #     if stream is True:
-    #         token_hop_len = self.token_min_hop_len
-    #         while True:
-    #             time.sleep(0.1)
-    #             if len(self.tts_speech_token_dict[this_uuid]) >= token_hop_len + self.token_overlap_len:
-    #                 this_tts_speech_token = torch.tensor(self.tts_speech_token_dict[this_uuid][:token_hop_len + self.token_overlap_len]) \
-    #                     .unsqueeze(dim=0)
-    #                 this_tts_speech = self.token2wav(token=this_tts_speech_token,
-    #                                                  prompt_token=flow_prompt_speech_token,
-    #                                                  prompt_feat=prompt_speech_feat,
-    #                                                  embedding=flow_embedding,
-    #                                                  uuid=this_uuid,
-    #                                                  finalize=False)
-    #                 yield {'tts_speech': this_tts_speech.cpu()}
-    #                 with self.lock:
-    #                     self.tts_speech_token_dict[this_uuid] = self.tts_speech_token_dict[this_uuid][token_hop_len:]
-    #                 # increase token_hop_len for better speech quality
-    #                 token_hop_len = min(self.token_max_hop_len, int(token_hop_len * self.stream_scale_factor))
-    #             if self.llm_end_dict[this_uuid] is True and len(self.tts_speech_token_dict[this_uuid]) < token_hop_len + self.token_overlap_len:
-    #                 break
-    #         p.join()
-    #         # deal with remain tokens, make sure inference remain token len equals token_hop_len when cache_speech is not None
-    #         this_tts_speech_token = torch.tensor(self.tts_speech_token_dict[this_uuid]).unsqueeze(dim=0)
-    #         this_tts_speech = self.token2wav(token=this_tts_speech_token,
-    #                                          prompt_token=flow_prompt_speech_token,
-    #                                          prompt_feat=prompt_speech_feat,
-    #                                          embedding=flow_embedding,
-    #                                          uuid=this_uuid,
-    #                                          finalize=True)
-    #         yield {'tts_speech': this_tts_speech.cpu()}
-    #     else:
-    #         # deal with all tokens
-    #         p.join()
-    #         this_tts_speech_token = torch.tensor(self.tts_speech_token_dict[this_uuid]).unsqueeze(dim=0)
-    #         this_tts_speech = self.token2wav(token=this_tts_speech_token,
-    #                                          prompt_token=flow_prompt_speech_token,
-    #                                          prompt_feat=prompt_speech_feat,
-    #                                          embedding=flow_embedding,
-    #                                          uuid=this_uuid,
-    #                                          finalize=True,
-    #                                          speed=speed)
-    #         yield {'tts_speech': this_tts_speech.cpu()}
-    #     with self.lock:
-    #         self.tts_speech_token_dict.pop(this_uuid)
-    #         self.llm_end_dict.pop(this_uuid)
-    #         self.mel_overlap_dict.pop(this_uuid)
-    #         self.hift_cache_dict.pop(this_uuid)
-    #         self.flow_cache_dict.pop(this_uuid)
-    #     if torch.cuda.is_available():
-    #         torch.cuda.empty_cache()
-    #         torch.cuda.current_stream().synchronize()
-            
-    # [V1] 즉시 처리 로직 (이전 코드와 동일)
     def tts(self, text=torch.zeros(1, 0, dtype=torch.int32), flow_embedding=torch.zeros(0, 192), llm_embedding=torch.zeros(0, 192),
                 prompt_text=torch.zeros(1, 0, dtype=torch.int32),
                 llm_prompt_speech_token=torch.zeros(1, 0, dtype=torch.int32),
@@ -542,185 +472,67 @@ class CosyVoice2Model(CosyVoiceModel):
         return tts_speech
 
     def tts(self, text=torch.zeros(1, 0, dtype=torch.int32), flow_embedding=torch.zeros(0, 192), llm_embedding=torch.zeros(0, 192),
-            prompt_text=torch.zeros(1, 0, dtype=torch.int32),
-            llm_prompt_speech_token=torch.zeros(1, 0, dtype=torch.int32),
-            flow_prompt_speech_token=torch.zeros(1, 0, dtype=torch.int32),
-            prompt_speech_feat=torch.zeros(1, 0, 80), source_speech_token=torch.zeros(1, 0, dtype=torch.int32), stream=False, speed=1.0, **kwargs):
-        # this_uuid is used to track variables related to this inference thread
-        this_uuid = str(uuid.uuid1())
-        with self.lock:
-            self.tts_speech_token_dict[this_uuid], self.llm_end_dict[this_uuid] = [], False
-            self.hift_cache_dict[this_uuid] = None
-        if source_speech_token.shape[1] == 0:
-            p = threading.Thread(target=self.llm_job, args=(text, prompt_text, llm_prompt_speech_token, llm_embedding, this_uuid))
-        else:
-            p = threading.Thread(target=self.vc_job, args=(source_speech_token, this_uuid))
-        p.start()
-        
-        # ================================================================
-        # [핵심 수정] CosyVoice2Model을 위한 "탐욕적(Greedy) 청킹" 정책
-        # ================================================================
-        if stream is True:
-            token_offset = 0
-            prompt_token_pad = int(np.ceil(flow_prompt_speech_token.shape[1] / self.token_hop_len) * self.token_hop_len - flow_prompt_speech_token.shape[1])
+                prompt_text=torch.zeros(1, 0, dtype=torch.int32),
+                llm_prompt_speech_token=torch.zeros(1, 0, dtype=torch.int32),
+                flow_prompt_speech_token=torch.zeros(1, 0, dtype=torch.int32),
+                prompt_speech_feat=torch.zeros(1, 0, 80), source_speech_token=torch.zeros(1, 0, dtype=torch.int32), stream=False, speed=1.0, **kwargs):
             
-            while True:
-                # 0.05초마다 버퍼 확인
-                time.sleep(0.05)
-                
-                with self.lock:
-                    current_total_len = len(self.tts_speech_token_dict[this_uuid])
-                llm_is_done = self.llm_end_dict[this_uuid]
-
-                # --- 1. 변수 계산 ---
-                base_hop_len = self.token_hop_len + prompt_token_pad if token_offset == 0 else self.token_hop_len
-                available_len = current_total_len - token_offset
-
-                # [필수 조건] 1개 홉 처리에 '최소'로 필요한 토큰 수
-                # 이 조건이 충족되어야만 flow 모델이 lookahead를 수행할 수 있습니다.
-                min_required_len = base_hop_len + self.flow.pre_lookahead_len
-                
-                hops_to_process = 0
-
-                # --- 2. Greedy 정책 적용 (조건 느슨하게) ---
-                
-                # '최소' 조건만 충족하면
-                if available_len >= min_required_len:
-                    # 현재 버퍼에서 처리 가능한 *모든* 홉을 계산
-                    
-                    # (1) 첫 홉(base_hop) 이후 남은 토큰
-                    available_for_extra_hops = available_len - min_required_len
-                    # (2) 남은 토큰으로 몇 개의 추가 홉을 만들 수 있는지 계산
-                    extra_hops = available_for_extra_hops // self.token_hop_len
-                    
-                    # (3) 처리할 총 홉 = 1 (기본) + 추가 홉
-                    hops_to_process = 1 + extra_hops
-                    
-                    # (4) 안정성을 위해 최대 홉 개수 제한
-                    hops_to_process = min(hops_to_process, self.token_max_hop_count)
-                
-                # --- 3. 종료 조건 ---
-                # LLM이 끝났고, 버퍼에 남은 토큰이 '최소' 조건도 충족 못하면 종료
-                if llm_is_done and available_len < min_required_len:
-                    break
-
-                # --- 4. 오디오 청크 처리 ---
-                if hops_to_process > 0:
-                    # 이번에 처리할 총 홉 길이 (토큰 수)
-                    total_hop_len_to_process = base_hop_len + (hops_to_process - 1) * self.token_hop_len
-                    # 모델에 전달할 총 토큰 길이 (lookahead 포함)
-                    total_tokens_to_pass = token_offset + total_hop_len_to_process + self.flow.pre_lookahead_len
-
-                    with self.lock:
-                        this_tts_speech_token = torch.tensor(self.tts_speech_token_dict[this_uuid][:total_tokens_to_pass]).unsqueeze(dim=0)
-                    
-                    this_tts_speech = self.token2wav(token=this_tts_speech_token,
-                                                     prompt_token=flow_prompt_speech_token,
-                                                     prompt_feat=prompt_speech_feat,
-                                                     embedding=flow_embedding,
-                                                     token_offset=token_offset,
-                                                     uuid=this_uuid,
-                                                     stream=stream,
-                                                     finalize=False) # [중요] "내부에서 붙이기"
-                    
-                    token_offset += total_hop_len_to_process
-                    
-                    if this_tts_speech.numel() > 0:
-                        yield {'tts_speech': this_tts_speech.cpu()}
-            
-            # --- 5. 남은 토큰 finalizing ---
-            p.join()
-            
+            # 1. 세션 및 스레드 초기화 (기존과 동일)
+            this_uuid = str(uuid.uuid1())
             with self.lock:
-                final_total_len = len(self.tts_speech_token_dict[this_uuid])
+                self.tts_speech_token_dict[this_uuid], self.llm_end_dict[this_uuid] = [], False
+                self.hift_cache_dict[this_uuid] = None
+            if source_speech_token.shape[1] == 0:
+                p = threading.Thread(target=self.llm_job, args=(text, prompt_text, llm_prompt_speech_token, llm_embedding, this_uuid))
+            else:
+                p = threading.Thread(target=self.vc_job, args=(source_speech_token, this_uuid))
+            p.start()
             
-            # 아직 처리되지 않은 토큰이 남아있는 경우
-            if final_total_len > token_offset:
-                this_tts_speech_token = torch.tensor(self.tts_speech_token_dict[this_uuid]).unsqueeze(dim=0)
-                this_tts_speech = self.token2wav(token=this_tts_speech_token,
-                                                 prompt_token=flow_prompt_speech_token,
-                                                 prompt_feat=prompt_speech_feat,
-                                                 embedding=flow_embedding,
-                                                 token_offset=token_offset,
-                                                 uuid=this_uuid,
-                                                 finalize=True) # [중요] 마지막은 True
-                if this_tts_speech.numel() > 0:
-                    yield {'tts_speech': this_tts_speech.cpu()}
-        
-        # ================================================================
-        # 비스트리밍 로직 (기존과 동일)
-        # ================================================================
-        else:
-            # deal with all tokens
-            p.join()
-            this_tts_speech_token = torch.tensor(self.tts_speech_token_dict[this_uuid]).unsqueeze(dim=0)
-            this_tts_speech = self.token2wav(token=this_tts_speech_token,
-                                             prompt_token=flow_prompt_speech_token,
-                                             prompt_feat=prompt_speech_feat,
-                                             embedding=flow_embedding,
-                                             token_offset=0,
-                                             uuid=this_uuid,
-                                             finalize=True,
-                                             speed=speed)
-            yield {'tts_speech': this_tts_speech.cpu()}
-        
-        # 세션 정리
-        with self.lock:
-            self.tts_speech_token_dict.pop(this_uuid)
-            self.llm_end_dict.pop(this_uuid)
-            self.hift_cache_dict.pop(this_uuid)
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.current_stream().synchronize()
+            
+            # 2. [핵심 수정] "누적 2회 공백" 기반 일괄 처리 로직
+            # 'stream' 플래그 값과 관계없이, LLM 스레드가 완료될 때까지 기다립니다.
+            # LLM 스레드(llm_job)는 app_stream_tts.py의 text_generator가
+            # 'None' (누적 공백 2회)을 받을 때까지 실행됩니다.
+            
+            # LLM 스레드가 완료될 때까지(즉, 트리거가 발생할 때까지) 여기서 대기합니다.
+            p.join() 
 
-    # (V2 모델의 주석 처리된 이전 tts 메서드 - 참고용)
-    # def tts(self, text=torch.zeros(1, 0, dtype=torch.int32), flow_embedding=torch.zeros(0, 192), llm_embedding=torch.zeros(0, 192),
-    #         prompt_text=torch.zeros(1, 0, dtype=torch.int32),
-    #         llm_prompt_speech_token=torch.zeros(1, 0, dtype=torch.int32),
-    #         flow_prompt_speech_token=torch.zeros(1, 0, dtype=torch.int32),
-    #         prompt_speech_feat=torch.zeros(1, 0, 80), source_speech_token=torch.zeros(1, 0, dtype=torch.int32), stream=False, speed=1.0, **kwargs):
-    #     # this_uuid is used to track variables related to this inference thread
-    #     this_uuid = str(uuid.uuid1())
-    #     with self.lock:
-    #         self.tts_speech_token_dict[this_uuid], self.llm_end_dict[this_uuid] = [], False
-    #         self.hift_cache_dict[this_uuid] = None
-    #     if source_speech_token.shape[1] == 0:
-    #         p = threading.Thread(target=self.llm_job, args=(text, prompt_text, llm_prompt_speech_token, llm_embedding, this_uuid))
-    #     else:
-    #         p = threading.Thread(target=self.vc_job, args=(source_speech_token, this_uuid))
-    #     p.start()
-    #     if stream is True:
-    #         token_offset = 0
-    #         prompt_token_pad = int(np.ceil(flow_prompt_speech_token.shape[1] / self.token_hop_len) * self.token_hop_len - flow_prompt_speech_token.shape[1])
-    #         while True:
-    #             time.sleep(0.1)
-    #             this_token_hop_len = self.token_hop_len + prompt_token_pad if token_offset == 0 else self.token_hop_len
-    #             if len(self.tts_speech_token_dict[this_uuid]) - token_offset >= this_token_hop_len + self.flow.pre_lookahead_len:
-    #                 this_tts_speech_token = torch.tensor(self.tts_speech_token_dict[this_uuid][:token_offset + this_token_hop_len + self.flow.pre_lookahead_len]).unsqueeze(dim=0)
-    #                 this_tts_speech = self.token2wav(token=this_tts_speech_token,
-    #                                                  prompt_token=flow_prompt_speech_token,
-    #                                                  prompt_feat=prompt_speech_feat,
-    #                                                  embedding=flow_embedding,
-    #                                                  token_offset=token_offset,
-    #                                                  uuid=this_uuid,
-    #                                                  stream=stream,
-    #                                                  finalize=False)
-    #                 token_offset += this_token_hop_len
-    #                 yield {'tts_speech': this_tts_speech.cpu()}
-    #             if self.llm_end_dict[this_uuid] is True and len(self.tts_speech_token_dict[this_uuid]) - token_offset < this_token_hop_len + self.flow.pre_lookahead_len:
-    #                 break
-    #         p.join()
-    #         # deal with remain tokens, make sure inference remain token len equals token_hop_len when cache_speech is not None
-    #         this_tts_speech_token = torch.tensor(self.tts_speech_token_dict[this_uuid]).unsqueeze(dim=0)
-    #         this_tts_speech = self.token2wav(token=this_tts_speech_token,
-    #                                          prompt_token=flow_prompt_speech_token,
-    #                                          prompt_feat=prompt_speech_feat,
-    #                                          embedding=flow_embedding,
-    #                                          token_offset=token_offset,
-    #                                          uuid=this_uuid,
-    #                                          finalize=True)
-    #         yield {'tts_speech': this_tts_speech.cpu()}
-    #     else:
-    #         # (비스트리밍 로직)
-    #     with self.lock:
-    #         # (세션 정리)
+            logging.info(f"[{this_uuid}] LLM job finished. Consuming all accumulated tokens.")
+
+            # 3. 누적된 모든 토큰 가져오기
+            # LLM 스레드가 종료되었으므로, tts_speech_token_dict에 모든 토큰이 들어있음
+            with self.lock:
+                all_tokens = self.tts_speech_token_dict[this_uuid]
+            
+            # 4. 모든 토큰을 한 번에 오디오로 변환 (비스트리밍 방식)
+            if not all_tokens:
+                logging.warning(f"[{this_uuid}] No speech tokens were generated. Yielding empty audio.")
+                this_tts_speech = torch.empty(1, 0)
+            else:
+                logging.info(f"[{this_uuid}] Processing all {len(all_tokens)} tokens at once (finalize=True).")
+                this_tts_speech_token = torch.tensor(all_tokens).unsqueeze(dim=0)
+                
+                # 모든 토큰을 한 번에 token2wav로 전달
+                this_tts_speech = self.token2wav(token=this_tts_speech_token,
+                                                prompt_token=flow_prompt_speech_token,
+                                                prompt_feat=prompt_speech_feat,
+                                                embedding=flow_embedding,
+                                                token_offset=0, # 처음부터 처리
+                                                uuid=this_uuid,
+                                                stream=False,   # 스트리밍 모드 아님
+                                                finalize=True, # 한 번에 처리
+                                                speed=speed)
+
+            # 5. 최종 오디오 반환
+            yield {'tts_speech': this_tts_speech.cpu()}
+            
+            # (기존의 if stream is True: ... else: ... 블록 전체가 위 로직으로 대체됨)
+
+            # 6. 세션 정리
+            with self.lock:
+                self.tts_speech_token_dict.pop(this_uuid)
+                self.llm_end_dict.pop(this_uuid)
+                self.hift_cache_dict.pop(this_uuid)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.current_stream().synchronize()
