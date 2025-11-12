@@ -40,7 +40,8 @@ logging.basicConfig(
 app = Flask(__name__)
 CORS(app) 
 
-SAVE_ACCUMULATED_AUDIO = True
+# [수정] 오디오 파일 저장을 비활성화합니다.
+SAVE_ACCUMULATED_AUDIO = False
 
 OUTPUT_DIR = os.path.join(PROJ_DIR, "outputs")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -69,15 +70,12 @@ class Session:
     sid: str
     last_sent_len: int = 0
     sse_q: queue.Queue = field(default_factory=queue.Queue)
-    # [수정] 큐가 텍스트 외에 (None, bool) 튜플도 처리
     text_stream_q: queue.Queue = field(default_factory=queue.Queue)
     worker_thread: Optional[threading.Thread] = None
     stop_event: threading.Event = field(default_factory=threading.Event)
     accumulated_audio: List[torch.Tensor] = field(default_factory=list)
-    
-    # [수정] 카운터 및 컨텍스트 유지 플래그
     single_space_count: int = 0
-    keep_context: bool = True # 다음 배치가 컨텍스트를 이어받을지 여부
+    keep_context: bool = True
 
 SESSIONS: Dict[str, Session] = {}
 SESS_LOCK = threading.Lock()
@@ -94,7 +92,7 @@ def get_or_create_session(sid: str) -> Session:
     return sess
 
 # ==============================
-# 3) TTS Worker & Synthesizer [하이브리드 버전]
+# 3) TTS Worker & Synthesizer [수정된 버전]
 # ==============================
 def tts_worker(sess: Session):
     print(f"[{sess.sid}] TTS worker started. Waiting for first text chunk...")
@@ -102,32 +100,31 @@ def tts_worker(sess: Session):
     while not sess.stop_event.is_set():
         
         try:
-            # [수정] 텍스트 또는 (None, bool) 튜플을 받음
             first_chunk_or_signal: Any = sess.text_stream_q.get(timeout=1.0) 
         except queue.Empty:
             continue 
 
-        # [수정] 신호 처리 로직
         if isinstance(first_chunk_or_signal, tuple):
             marker, keep_context = first_chunk_or_signal
-            sess.keep_context = keep_context # 세션의 keep_context 플래그 업데이트
+            sess.keep_context = keep_context
             
             if marker is None:
-                logging.info(f"[{sess.sid}] Got EOS Signal (Keep Context: {keep_context}). Sending 'end'.")
-                sess.sse_q.put(json.dumps({"type": "end"}))
+                # [수정] 'end' 메시지는 구두점(keep_context=False)일 때만 전송
+                if not keep_context:
+                    logging.info(f"[{sess.sid}] Got EOS Signal (Keep Context: False). Sending 'end'.")
+                    sess.sse_q.put(json.dumps({"type": "end"}))
+                else:
+                    logging.info(f"[{sess.sid}] Got EOS Signal (Keep Context: True). Not sending 'end' message.")
                 continue
             else:
-                # 예상치 못한 튜플
                 logging.warning(f"[{sess.sid}] Received unexpected tuple: {first_chunk_or_signal}")
                 continue
         
-        # 튜플이 아니면 텍스트 청크임
         first_chunk = first_chunk_or_signal
         logging.info(f"[{sess.sid}] First chunk received. Starting inference run.")
         text_for_this_run = first_chunk 
 
-        if SAVE_ACCUMULATED_AUDIO:
-            sess.accumulated_audio.clear()
+        sess.accumulated_audio.clear()
 
         def text_generator() -> Generator[str, None, None]:
             nonlocal text_for_this_run
@@ -138,14 +135,13 @@ def tts_worker(sess: Session):
             buffer = "" 
             while not sess.stop_event.is_set():
                 try:
-                    # [수정] 텍스트 또는 (None, bool) 튜플을 받음
                     chunk_or_signal = sess.text_stream_q.get(timeout=0.1) 
                     
                     if isinstance(chunk_or_signal, tuple):
                         marker, keep_context = chunk_or_signal
-                        sess.keep_context = keep_context # [중요] 컨텍스트 플래그 설정
+                        sess.keep_context = keep_context
                         
-                        if marker is None: # EOS (종료) 신호
+                        if marker is None:
                             if buffer:
                                 logging.info(f"[{sess.sid}] EOS marker. Flushing buffer: '{buffer}'")
                                 text_for_this_run += buffer 
@@ -154,7 +150,7 @@ def tts_worker(sess: Session):
                             logging.info(f"[{sess.sid}] EOS marker received (Keep Context: {keep_context}). Terminating text generator.")
                             break 
                     
-                    else: # 텍스트 청크인 경우
+                    else:
                         chunk = chunk_or_signal
                         buffer += chunk
                         
@@ -162,9 +158,7 @@ def tts_worker(sess: Session):
                         if last_space_index != -1:
                             to_yield = buffer[:last_space_index + 1]
                             buffer = buffer[last_space_index + 1:]
-                            
                             text_for_this_run += to_yield
-                            
                             logging.info(f"[{sess.sid}] Yielding by space: '{to_yield.strip()}' | Remaining in buffer: '{buffer.strip()}'")
                             yield to_yield
                                 
@@ -182,8 +176,8 @@ def tts_worker(sess: Session):
         use_frontend = True 
         logging.info(f"[{sess.sid}] Starting new TTS inference loop. Using Text Frontend: {use_frontend}")
         
+        all_chunks_for_this_run = []
         try:
-            # [수정] session_id와 keep_context 전달
             for out in cosyvoice.inference_instruct2(
                     tts_text=text_generator(), 
                     instruct_text="",
@@ -192,53 +186,60 @@ def tts_worker(sess: Session):
                     stream=True,
                     speed=1.0,
                     text_frontend=use_frontend,
-                    session_id=sess.sid, # <--- [핵심] 세션 ID 전달
-                    keep_context=sess.keep_context # <--- [핵심] 컨텍스트 유지 여부 전달
+                    session_id=sess.sid,
+                    keep_context=sess.keep_context
             ):
                 audio_chunk = out["tts_speech"].cpu()
-                
-                if SAVE_ACCUMULATED_AUDIO:
-                    sess.accumulated_audio.append(audio_chunk)
-
                 if audio_chunk.numel() > 0:
-                    buf = io.BytesIO()
-                    torchaudio.save(buf, audio_chunk, SAMPLE_RATE, format="wav")
-                    buf.seek(0)
-                    wav_chunk_bytes = buf.read()
-                    b64 = base64.b64encode(wav_chunk_bytes).decode("utf-8")
-                    sess.sse_q.put(json.dumps({"type": "streaming_audio", "b64wav": b64}))
+                    all_chunks_for_this_run.append(audio_chunk)
 
         except Exception as e:
             logging.error(f"[{sess.sid}] TTS (instruct2) Error: {e}", exc_info=True)
             sess.sse_q.put(json.dumps({"type": "log", "msg": f"TTS error: {e}"}))
+            continue
 
-        if SAVE_ACCUMULATED_AUDIO and sess.accumulated_audio and text_for_this_run.strip():
-            try:
-                final_audio = torch.cat(sess.accumulated_audio, dim=1)
-                save_filename = f"session_audio_{sess.sid}_{int(time.time())}.wav" 
-                save_path = os.path.join(OUTPUT_DIR, save_filename)
-                
-                torchaudio.save(save_path, final_audio, SAMPLE_RATE, format="wav")
-                logging.info(f"[{sess.sid}] ✅ Accumulated audio saved successfully to: {save_path}")
+        if not all_chunks_for_this_run:
+            logging.warning(f"[{sess.sid}] No audio was generated for this run.")
+            continue
+            
+        final_audio = torch.cat(all_chunks_for_this_run, dim=1)
+        final_text = text_for_this_run.strip()
 
-                file_url = f"/outputs/{save_filename}"
-                
-                final_text = text_for_this_run.strip()
-                logging.info(f"[{sess.sid}] SENDING 'final_audio' with TEXT: '{final_text}'")
-                
+        # --- [로직 수정 시작] ---
+        
+        # [수정] 이제 keep_context 여부와 관계없이 모든 오디오를 Base64로 인코딩하여
+        # 'streaming_audio' 또는 'final_audio' 타입으로 보냅니다.
+        
+        try:
+            buf = io.BytesIO()
+            torchaudio.save(buf, final_audio, SAMPLE_RATE, format="wav")
+            buf.seek(0)
+            wav_chunk_bytes = buf.read()
+            b64 = base64.b64encode(wav_chunk_bytes).decode("utf-8")
+            
+            if not sess.keep_context:
+                # === 최종 배치 (Final Batch) ===
+                # (구두점 입력 시, keep_context=False)
+                # 'final_audio' 타입으로 Base64와 텍스트를 함께 보냅니다.
+                logging.info(f"[{sess.sid}] This was a FINAL batch (keep_context=False). Sending 'final_audio' with Base64.")
                 sess.sse_q.put(json.dumps({
                     "type": "final_audio",
-                    "url": file_url,
+                    "b64wav": b64,
                     "text": final_text
                 }))
+            
+            else:
+                # === 중간 배치 (Interim Batch) ===
+                # (누적 공백 2회 시, keep_context=True)
+                # 'streaming_audio' 타입으로 Base64만 보냅니다.
+                logging.info(f"[{sess.sid}] This was an INTERIM batch (keep_context=True). Sending 'streaming_audio'.")
+                sess.sse_q.put(json.dumps({"type": "streaming_audio", "b64wav": b64}))
 
-            except Exception as e:
-                logging.error(f"[{sess.sid}] ❌ Failed to save accumulated audio: {e}")
-            finally:
-                sess.accumulated_audio.clear()
+        except Exception as e:
+             logging.error(f"[{sess.sid}] ❌ Failed to encode/send audio as Base64: {e}")
+
+        # --- [로직 수정 끝] ---
         
-        # [수정] 'end' 메시지는 EOS 신호를 받을 때만 보내므로 여기서 제거
-        # sess.sse_q.put(json.dumps({"type": "end"}))
         logging.info(f"[{sess.sid}] Inference run finished. Waiting for next text chunk...")
     
     print(f"[{sess.sid}] TTS worker fully stopped.")
@@ -250,6 +251,7 @@ def tts_worker(sess: Session):
 
 @app.route('/outputs/<path:filename>')
 def serve_output_file(filename):
+    # 이 라우트는 이제 사용되지 않지만, 호환성을 위해 남겨둡니다.
     logging.info(f"Serving file: {filename} from {OUTPUT_DIR}")
     return send_from_directory(OUTPUT_DIR, filename, as_attachment=False)
 
@@ -262,12 +264,12 @@ def type_event():
     data = request.get_json(force=True)
     sid = data.get("sid") or str(uuid.uuid4())
     text = data.get("text", "")
-    force_from_client = data.get("force", False) # 클라이언트가 보낸 force (예: 구두점)
+    force_from_client = data.get("force", False)
 
     sess = get_or_create_session(sid)
     
     new_text_chunk = None
-    force_from_server = False # 서버가 결정한 force (누적 공백)
+    force_from_server = False
     
     if len(text) > sess.last_sent_len:
         new_text_chunk = text[sess.last_sent_len:]
@@ -283,19 +285,15 @@ def type_event():
         logging.info(f"[{sid}] Queued new text chunk: '{new_text_chunk.strip()}'")
         sess.last_sent_len = len(text)
     
-    # 서버 트리거 확인: 누적 공백 2회
     if sess.single_space_count >= 2:
         logging.info(f"[{sid}] TRIGGER HIT (2 cumulative spaces). Setting server_force=true.")
         force_from_server = True
-        sess.single_space_count = 0 # 트리거 발동 후 카운터 초기화
+        sess.single_space_count = 0
 
-    # [수정] 튜플 (None, keep_context)을 큐에 삽입
     if force_from_client:
-        # 클라이언트가 force (구두점)하면, 컨텍스트 종료
         logging.info(f"[{sid}] Force flush (Client). Queueing EOS (Keep Context: False).")
         sess.text_stream_q.put((None, False))
     elif force_from_server:
-        # 서버가 force (누적 공백 2회)하면, 컨텍스트 유지
         logging.info(f"[{sid}] Force flush (Server). Queueing EOS (Keep Context: True).")
         sess.text_stream_q.put((None, True))
 

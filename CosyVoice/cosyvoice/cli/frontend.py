@@ -94,8 +94,8 @@ class CosyVoiceFrontEnd:
             return self._extract_text_token_generator(text), torch.tensor([0], dtype=torch.int32).to(self.device)
         else:
             text_token = self.tokenizer.encode(text, allowed_special=self.allowed_special)
-            logging.info(f"[BPE-DEBUG | _extract_text_token] input='{text}'")
-            logging.info(f"[BPE-DEBUG | _extract_text_token] ids={text_token}")
+            logging.info(f"███████[BPE-DEBUG | _extract_text_token] input='{text}'███████")
+            logging.info(f"███████[BPE-DEBUG | _extract_text_token] ids={text_token}███████")
 
             try:
                 # HuggingFace 기반 토크나이저면 이렇게 원래 subword 단위로 변환 시도

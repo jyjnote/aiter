@@ -133,7 +133,7 @@
 <body>
 
   <div class="container">
-    <h1>Streaming TTS (Hybrid Strategy)</h1>
+    <h1>Streaming TTS (No-Save Strategy)</h1>
     <p>실시간으로 음성이 재생되며, 문장 끝에서 플레이어가 생성됩니다.</p>
     
     <textarea id="ta" placeholder="여기에 문장을 입력하세요."></textarea>
@@ -175,7 +175,8 @@
 
   const audioContext = new (window.AudioContext || window.webkitAudioContext)();
   let streamingDuration = 0; 
-  let isWaitingForFinal = false; 
+  // [수정] isWaitingForFinal 플래그를 제거합니다.
+  // let isWaitingForFinal = false; 
 
   function addLog(message) {
     console.log(message);
@@ -185,29 +186,44 @@
   const q = [];
   let playing = false;
   
-  function playStreamingChunk(b64) {
-    if (!audioContext) return;
+  // Base64 데이터를 받아 Blob URL로 변환하고 재생 큐에 추가하는 함수
+  function b64ToBlobUrl(b64) {
     try {
       const byteChars = atob(b64);
       const byteNums = new Array(byteChars.length);
       for (let i = 0; i < byteChars.length; i++) byteNums[i] = byteChars.charCodeAt(i);
       const byteArray = new Uint8Array(byteNums);
-
       const blob = new Blob([byteArray], { type: 'audio/wav' });
-      const url = URL.createObjectURL(blob);
-      q.push(url);
-      if (!playing) playNext();
+      return URL.createObjectURL(blob);
+    } catch (error) {
+      addLog(`[AUDIO] Base64 디코딩 오류: ${error}`);
+      return null;
+    }
+  }
 
+  function playStreamingChunk(b64) {
+    if (!audioContext) return;
+    
+    const url = b64ToBlobUrl(b64);
+    if (!url) return; // 디코딩 실패
+    
+    q.push(url);
+    if (!playing) playNext();
+
+    // 가짜 프로그레스 바 업데이트 로직 (선택 사항)
+    try {
+      const byteChars = atob(b64);
+      const byteNums = new Array(byteChars.length);
+      for (let i = 0; i < byteChars.length; i++) byteNums[i] = byteChars.charCodeAt(i);
+      const byteArray = new Uint8Array(byteNums);
       const bufferToDecode = byteArray.buffer.slice(0);
+      
       audioContext.decodeAudioData(bufferToDecode, (audioBuffer) => {
         streamingDuration += audioBuffer.duration;
         fakeProgressFill.style.width = `${streamingDuration * 20}px`; 
         fakeDurationText.textContent = `${streamingDuration.toFixed(2)} 초`;
       }, (err) => addLog(`[AUDIO] 청크 디코딩 오류: ${err}`));
-      
-    } catch (error) {
-      addLog(`[AUDIO] 오디오 데이터 처리 오류: ${error}`);
-    }
+    } catch (e) {}
   }
 
   function playNext() {
@@ -229,6 +245,7 @@
     playNext();
   };
 
+  // [수정됨] 'final_audio' 메시지를 처리하는 함수
   function displayFinalAudio(msg) {
     fakePlayerContainer.style.display = 'none';
     streamingDuration = 0;
@@ -251,7 +268,26 @@
     audioElement.controls = true;
     audioElement.preload = 'auto';
     audioElement.autoplay = false; 
-    audioElement.src = msg.url; 
+
+    // [핵심 수정] final_audio도 b64wav를 사용합니다.
+    if (msg.b64wav) {
+        addLog(`[AUDIO] 최종 오디오 Base64 수신. Blob URL 생성 중...`);
+        const url = b64ToBlobUrl(msg.b64wav);
+        if (url) {
+            audioElement.src = url;
+            // Blob URL은 메모리를 사용하므로, 재생이 끝나면 해제
+            audioElement.onended = () => {
+                if (audioElement.src.startsWith('blob:')) {
+                    URL.revokeObjectURL(audioElement.src);
+                    addLog(`[AUDIO] Blob URL 해제: ${audioElement.src}`);
+                }
+            };
+        } else {
+             textElement.textContent += " (오디오 로딩 실패)";
+        }
+    } else {
+        addLog(`[AUDIO] 오류: 'final_audio' 메시지에 'b64wav' 필드가 없습니다.`);
+    }
 
     newSentenceDiv.appendChild(textElement);
     newSentenceDiv.appendChild(audioElement);
@@ -264,42 +300,24 @@
   
   es.onopen = () => addLog("✅ SSE 연결 성공!");
   
+  // [수정] es.onmessage 핸들러
   es.onmessage = (e) => {
     try {
       const msg = JSON.parse(e.data);
 
-      if (isWaitingForFinal) {
-        if (msg.type === 'streaming_audio') {
-          addLog("[WAITING] 스트리밍 청크 무시함.");
-          return; 
-        }
-        if (msg.type === 'final_audio') {
-          addLog(`✅ [WAITING] 최종 파일 수신: ${msg.text}`);
-          isWaitingForFinal = false; 
-          displayFinalAudio(msg);
-          return; 
-        }
-        if (msg.type === 'end') {
-          addLog("🏁 [WAITING] End 메시지 수신.");
-          isWaitingForFinal = false; 
-          fakePlayerContainer.style.display = 'none';
-          streamingDuration = 0;
-          return; 
-        }
-        if (msg.type === 'log') {
-          addLog(`[SERVER LOG] ${msg.msg}`);
-        }
-        return; 
-      }
-
+      // [수정] isWaitingForFinal 로직을 제거하고 모든 메시지를 즉시 처리합니다.
       if (msg.type === 'streaming_audio' && msg.b64wav) {
+        // 띄어쓰기 2회로 인한 중간 오디오
+        addLog(`[AUDIO] 스트리밍 청크 수신. 즉시 재생합니다.`);
         fakePlayerContainer.style.display = 'block';
         playStreamingChunk(msg.b64wav);
       
-      } else if (msg.type === 'final_audio') {
-        addLog(`[!] (경고) 대기 상태가 아닐 때 final_audio 수신: ${msg.text}`);
-        displayFinalAudio(msg);
-
+      } else if (msg.type === 'final_audio' && msg.b64wav) {
+        // 구두점으로 인한 최종 오디오
+        addLog(`[AUDIO] 최종 오디오 수신: ${msg.text}. 즉시 재생합니다.`);
+        playStreamingChunk(msg.b64wav); // 스트리밍 플레이어로 즉시 재생
+        displayFinalAudio(msg); // 동시에 하단 기록에도 추가
+      
       } else if (msg.type === 'log') {
         addLog(`[SERVER LOG] ${msg.msg}`);
       
@@ -336,15 +354,13 @@
     fakePlayerText.textContent = `"${text}"`;
     
     if (force) {
-      // [수정] 입력창을 비우지 않음 (중복 입력 현상 방지)
-      // ta.value = ''; 
-      
-      q.length = 0; 
-      isWaitingForFinal = true; 
+      q.length = 0; // 재생 큐 비우기
+      // [수정] isWaitingForFinal 플래그를 설정하지 않습니다.
+      // isWaitingForFinal = true; 
     }
   }
 
-  // --- 4. 입력 이벤트 핸들러 [핵심 수정] ---
+  // --- 4. 입력 이벤트 핸들러 (변경 없음) ---
   let isComposing = false;
   const punctuationRegex = /[.,?!]$/; 
 
@@ -353,15 +369,12 @@
     isComposing = true;
   });
 
-  // [핵심 버그 수정] 'compositionend'는 'isComposing' 플래그만 변경
   ta.addEventListener('compositionend', (e) => {
     isComposing = false;
     addLog("[INPUT] 한글 조합 완료.");
-    // [수정] handleInput(e) 호출을 여기서 삭제 (중복 호출 방지)
   });
 
   function handleInput(e) {
-    // [로그 추가] 이벤트 타입을 로그로 남김
     addLog(`[INPUT] 이벤트 발생 (Type: ${e.type}) | 조합 중: ${isComposing}`);
     
     if (isComposing) {

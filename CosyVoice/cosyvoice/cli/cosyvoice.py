@@ -197,6 +197,6 @@ class CosyVoice2(CosyVoice):
                                                 session_id=session_id, 
                                                 keep_context=keep_context):
                     speech_len = model_output['tts_speech'].shape[1] / self.sample_rate
-                    logging.info('yield speech len {}, rtf {}'.format(speech_len, (time.time() - start_time) / speech_len))
+                    logging.info('█████yield speech len {}, rtf {}█████'.format(speech_len, (time.time() - start_time) / speech_len))
                     yield model_output
                     start_time = time.time()
