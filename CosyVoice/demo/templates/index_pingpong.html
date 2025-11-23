@@ -1,0 +1,395 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <title>Streaming TTS (Ping-Pong Workers + Order Guarantee)</title>
+  
+  <style>
+    /* (스타일은 이전과 동일) */
+    body {
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, 'Noto Sans KR', sans-serif;
+      background-color: #f4f7f6;
+      color: #333;
+      margin: 0;
+      padding: 20px;
+    }
+    .container {
+      max-width: 800px;
+      margin: 20px auto;
+      padding: 2rem;
+      background-color: #ffffff;
+      border-radius: 12px;
+      box-shadow: 0 6px 18px rgba(0, 0, 0, 0.05);
+    }
+    h1 {
+      text-align: center;
+      color: #2c3e50;
+    }
+    textarea {
+      width: 100%;
+      height: 100px;
+      padding: 1rem;
+      font-size: 1rem;
+      border: 1px solid #dfe6e9;
+      border-radius: 8px;
+      box-sizing: border-box;
+      resize: vertical;
+      margin-bottom: 1rem;
+    }
+    /* [수정] 다운로드 버튼 스타일 제거 */
+    audio {
+      width: 100%;
+      margin-top: 0.5rem;
+    }
+    .log-container {
+      margin-top: 2rem;
+      border-top: 1px solid #eee;
+      padding-top: 1.5rem;
+    }
+    .log-container h3 { color: #6c757d; }
+    .log-container pre {
+      background-color: #282c34;
+      color: #abb2bf;
+      padding: 1rem;
+      border-radius: 8px;
+      max-height: 300px;
+      overflow-y: auto;
+      font-family: 'Courier New', Courier, monospace;
+      font-size: 0.9rem;
+      white-space: pre-wrap;
+    }
+    .worker-status {
+      display: flex;
+      justify-content: space-around;
+      margin-bottom: 1.5rem;
+    }
+    .worker-box {
+      border: 1px solid #eee;
+      padding: 1rem;
+      border-radius: 8px;
+      width: 45%;
+      text-align: center;
+      background-color: #f8f9fa;
+      transition: all 0.2s ease;
+      min-height: 80px;
+    }
+    .worker-box.A-active {
+      border-color: #007bff;
+      box-shadow: 0 2px 4px rgba(0, 123, 255, 0.1);
+      background-color: #f0f6ff;
+    }
+    .worker-box.B-active {
+      border-color: #28a745;
+      box-shadow: 0 2px 4px rgba(40, 167, 69, 0.1);
+      background-color: #f0fff4;
+    }
+    .worker-box p {
+      font-size: 0.9rem; 
+      color: #555;
+      word-break: break-all;
+    }
+  </style>
+</head>
+<body>
+
+  <div class="container">
+    <h1>Streaming TTS (Ping-Pong Workers + Order Guarantee)</h1>
+    
+    <div class="worker-status">
+      <div id="worker-A" class="worker-box">
+        <h3>Worker A (대기 중)</h3>
+      </div>
+      <div id="worker-B" class="worker-box">
+        <h3>Worker B (대기 중)</h3>
+      </div>
+    </div>
+    
+    <textarea id="ta" placeholder="여기에 문장을 입력하세요. (구두점 . ? ! 로 전송)"></textarea>
+    
+    <audio id="player" style="display: none;"></audio>
+
+    <div class="log-container">
+      <h3>상태 로그</h3>
+      <pre id="log"></pre>
+    </div>
+  </div>
+
+<script>
+(function() {
+  const sid = crypto.randomUUID();
+  const ta = document.getElementById('ta');
+  const log = document.getElementById('log');
+  const player = document.getElementById('player');
+  const workerA_div = document.getElementById('worker-A');
+  const workerB_div = document.getElementById('worker-B');
+  // [수정] 다운로드 버튼 변수 제거
+  // const downloadBtn = document.getElementById('download-btn');
+
+  let nextWorker = 'A';
+  let lastSentText = ""; // 텍스트박스 내용 유지를 위함
+
+  let batchIdCounter = 0;
+  let expectedBatchId = 0;
+  let audioHold = new Map(); 
+
+  // [신규] 재생 간격 로깅을 위한 변수
+  let lastPlaybackEndTime = null;
+
+  function addLog(message) {
+    console.log(message);
+    log.textContent = `[${new Date().toLocaleTimeString()}] ${message}\n` + log.textContent;
+  }
+
+  // --- 1. 오디오 재생 큐 ---
+  const q = [];
+  let playing = false;
+  
+  function b64ToBlobUrl(b64) {
+    try {
+      const byteChars = atob(b64);
+      const byteNums = new Array(byteChars.length);
+      for (let i = 0; i < byteChars.length; i++) byteNums[i] = byteChars.charCodeAt(i);
+      const byteArray = new Uint8Array(byteNums);
+      const blob = new Blob([byteArray], { type: 'audio/wav' });
+      return URL.createObjectURL(blob);
+    } catch (error) {
+      addLog(`[AUDIO] Base64 디코딩 오류: ${error}`);
+      return null;
+    }
+  }
+
+  function playStreamingChunk(b64) {
+    const url = b64ToBlobUrl(b64);
+    if (!url) return;
+    
+    q.push(url);
+    if (!playing) playNext();
+  }
+
+  // [수정] playNext 함수에 공백 시간 로깅 추가
+  function playNext() {
+    if (q.length === 0) { 
+      playing = false; 
+      return; 
+    }
+    playing = true;
+
+    // --- [신규] 재생 공백 시간 로깅 ---
+    if (lastPlaybackEndTime) {
+      const now = new Date().getTime();
+      const gap = (now - lastPlaybackEndTime) / 1000;
+      addLog(`[PERF] 🏁 이전 오디오 종료 후 다음 재생까지 공백: ${gap.toFixed(3)}초`);
+      lastPlaybackEndTime = null; // 로그 찍었으므로 리셋
+    }
+    // --- [신규] 로깅 끝 ---
+
+    const url = q.shift();
+    player.src = url;
+    player.play().catch(err => {
+      addLog(`[AUDIO] 재생 오류: ${err}`);
+      playing = false;
+    });
+  }
+  
+  // [수정] onended 함수에 공백 시간 로깅 추가
+  player.onended = () => {
+    const oldUrl = player.src;
+    if (oldUrl.startsWith('blob:')) {
+      URL.revokeObjectURL(oldUrl);
+    }
+    addLog(`[AUDIO] 재생 완료. (남은 큐: ${q.length})`);
+    
+    // --- [신규] 재생 종료 시간 기록 ---
+    lastPlaybackEndTime = new Date().getTime();
+    // --- [신규] 기록 끝 ---
+
+    playNext();
+  };
+
+  // --- 2. SSE 이벤트 리스너 (순서 보장 로직 포함, 변경 없음) ---
+  addLog(`세션 [${sid}] 시작. SSE 연결 대기 중...`);
+  const es = new EventSource("/sse_audio?sid=" + encodeURIComponent(sid)); 
+  
+  es.onopen = () => addLog("✅ SSE 연결 성공!");
+  
+  es.onmessage = (e) => {
+    try {
+      const msg = JSON.parse(e.data);
+      processSseMessage(msg);
+    } catch (err) {
+      addLog(`[SSE] parse error: ${err}`);
+    }
+  };
+  
+  es.onerror = (err) => {
+      addLog(`[SSE] 연결 오류 발생.`);
+  };
+
+  function processSseMessage(msg) {
+    if (msg.type === 'log') {
+        addLog(`[SERVER LOG] ${msg.msg}`);
+        return;
+    }
+    if (msg.type === 'ping') return;
+
+    if (msg.batchId === undefined) {
+        addLog(`[WARN] Batch ID가 없는 메시지 수신: ${msg.type}`);
+        return; 
+    }
+
+    if (msg.batchId === expectedBatchId) {
+        addLog(`[SYS] 기대했던 Batch ${msg.batchId} 수신. 처리합니다.`);
+        
+        if (msg.type === 'audio_chunk') {
+            addLog(`[AUDIO] (Batch ${msg.batchId}) 오디오 청크 수신 (${msg.text}). 재생 큐 추가.`);
+            playStreamingChunk(msg.b64wav);
+        } else if (msg.type === 'end') {
+            addLog(`🏁 (Batch ${msg.batchId}) 문장 작업 완료.`);
+        }
+        
+        expectedBatchId++;
+        checkAudioHold();
+
+    } else if (msg.batchId > expectedBatchId) {
+        addLog(`[SYS] 미래의 Batch ${msg.batchId} 수신. (기대: ${expectedBatchId}). 보관함에 저장.`);
+        
+        if (!audioHold.has(msg.batchId)) {
+            audioHold.set(msg.batchId, []);
+        }
+        audioHold.get(msg.batchId).push(msg);
+
+    } else {
+        addLog(`[WARN] 이미 처리된 Batch ${msg.batchId} 수신. (기대: ${expectedBatchId}). 무시.`);
+    }
+  }
+
+  function checkAudioHold() {
+    while (audioHold.has(expectedBatchId)) {
+        addLog(`[SYS] 보관함에서 Batch ${expectedBatchId}를 찾았습니다. 연속 처리합니다.`);
+        
+        const heldMessages = audioHold.get(expectedBatchId);
+        
+        for (const msg of heldMessages) {
+            if (msg.type === 'audio_chunk') {
+                addLog(`[AUDIO] (Batch ${msg.batchId}) 오디오 청크 수신 (${msg.text}). 재생 큐 추가.`);
+                playStreamingChunk(msg.b64wav);
+            } else if (msg.type === 'end') {
+                addLog(`🏁 (Batch ${msg.batchId}) 문장 작업 완료.`);
+            }
+        }
+        
+        audioHold.delete(expectedBatchId);
+        expectedBatchId++;
+    }
+  }
+
+  // --- 3. 텍스트 전송 로직 (텍스트박스 내용 유지, 변경 없음) ---
+  let textBuffer = ''; // 'sendText'가 호출될 때 보낼 텍스트 조각
+
+  function sendText() {
+    const textToSend = textBuffer.trim(); 
+    if (!textToSend) {
+        addLog("▶ 전송할 텍스트가 없습니다. 무시.");
+        textBuffer = '';
+        return;
+    }
+
+    const currentWorker = nextWorker;
+    const is_final = true; 
+    const batch_id_to_send = batchIdCounter;
+    batchIdCounter++; 
+
+    updateWorkerUI(currentWorker, textToSend, batch_id_to_send);
+
+    addLog(`▶▶▶ [Worker ${currentWorker}]에게 "배치 ${batch_id_to_send}" 전송: "${textToSend}"`);
+    
+    fetch('/synthesize_chunk', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ 
+        sid: sid, 
+        text_chunk: textToSend,
+        worker_id: currentWorker,
+        is_final: is_final,
+        batch_id: batch_id_to_send
+      })
+    })
+    .then(response => response.json())
+    .then(data => {
+      if(data.ok) {
+        nextWorker = (currentWorker === 'A') ? 'B' : 'A';
+        addLog(`[SYS] 다음 "배치 ${batchIdCounter}" 작업은 [Worker ${nextWorker}]가 받습니다.`);
+      } else {
+        addLog(`[API] /synthesize_chunk 호출 실패`);
+      }
+      setTimeout(() => {
+        updateWorkerUI(currentWorker, null, null);
+      }, 1000); 
+    })
+    .catch((err) => addLog(`[API] /synthesize_chunk 호출 실패: ${err}`));
+  }
+
+  function updateWorkerUI(workerId, text, batchId) {
+    const div = (workerId === 'A') ? workerA_div : workerB_div;
+    const activeClass = (workerId === 'A') ? 'A-active' : 'B-active';
+
+    div.querySelectorAll('p').forEach(p => p.remove());
+
+    if (text) {
+      div.querySelector('h3').textContent = `Worker ${workerId} (작업 중...)`;
+      const p = document.createElement('p');
+      p.textContent = `(ID: ${batchId}) "${text}"`;
+      div.appendChild(p);
+      div.classList.add(activeClass);
+    } else {
+      div.querySelector('h3').textContent = `Worker ${workerId} (대기 중)`;
+      div.classList.remove(activeClass);
+    }
+  }
+
+  let isComposing = false;
+  const punctuationRegex = /[.,?!]$/; 
+  const hasContentRegex = /[a-zA-Z0-9가-힣]/;
+
+  ta.addEventListener('compositionstart', () => isComposing = true);
+  ta.addEventListener('compositionend', (e) => {
+    isComposing = false;
+    handleInput(e);
+  });
+
+  // 입력 핸들러 로직 (텍스트박스 내용 유지, 변경 없음)
+  function handleInput(e) {
+    if (isComposing) return; 
+    
+    const currentText = ta.value;
+
+    if (punctuationRegex.test(currentText)) {
+      
+        // "새로 추가된 부분"만 찾습니다.
+        const newTextToSend = currentText.substring(lastSentText.length);
+        
+        if (hasContentRegex.test(newTextToSend)) {
+            addLog("▶ 구두점 입력: 새 문장 전송");
+            
+            textBuffer = newTextToSend;
+            sendText(); // 서버로 전송
+            
+            // 전송 완료 후, "마지막으로 전송한 텍스트" 위치를 갱신
+            lastSentText = currentText; 
+            
+        } else {
+            addLog("▶ 내용 없는 구두점 입력. 무시함.");
+            lastSentText = currentText;
+        }
+    } 
+  }
+  
+  ta.addEventListener('input', handleInput);
+
+  // --- 4. [수정] 다운로드 버튼 로직 제거 ---
+  // downloadBtn.addEventListener('click', () => { ... });
+
+})();
+</script>
+</body>
+</html>

@@ -3,13 +3,15 @@
 import os
 import sys
 import io
-import time
+import time  # time.perf_counter()를 위해 사용
 import json
 import base64
 import queue
 import threading
 import uuid
-import re  # <--- [수정] 정규표현식 모듈 추가
+import re 
+import csv  # <--- CSV 모듈
+
 from dataclasses import dataclass, field
 from typing import Dict, Optional, List, Generator, Any
 
@@ -62,6 +64,23 @@ print("모델 로드 완료.")
 
 SAMPLE_RATE = cosyvoice.sample_rate
 
+# --- CSV 파일 설정 ---
+MEASUREMENT_FILE = os.path.join(THIS_DIR, 'delay_measurements.csv')
+MEASUREMENT_LOCK = threading.Lock()
+
+# CSV 파일 헤더 초기화
+try:
+    with MEASUREMENT_LOCK:
+        with open(MEASUREMENT_FILE, 'w', newline='', encoding='utf-8-sig') as f: #<-- [수정] 엑셀 한글 깨짐 방지용 'utf-8-sig'
+            writer = csv.writer(f)
+            # --- [핵심 수정] ---
+            # 컬럼명을 한글로 변경
+            writer.writerow(['측정 시간', '배치 순서', '재생 딜레이(초)', '오디오 길이(초)', '배치 간 시간(초)'])
+            # --- [수정 끝] ---
+    logging.info(f"측정 로그 파일이 {MEASUREMENT_FILE} (으)로 초기화되었습니다.")
+except IOError as e:
+    logging.error(f"CSV 파일 쓰기 실패: {e}")
+
 # ==============================
 # 1) Session Management
 # ==============================
@@ -92,14 +111,20 @@ def get_or_create_session(sid: str) -> Session:
     return sess
 
 # ==============================
-# 3) TTS Worker & Synthesizer [필터링 로직 대폭 수정]
+# 3) TTS Worker & Synthesizer [CSV 저장 로직]
 # ==============================
 
-# [수정] 한글, 영어, 숫자 중 하나라도 포함되어 있는지 확인하는 정규식
 HAS_CONTENT_REGEX = re.compile(r'[a-zA-Z0-9가-힣]')
 
 def tts_worker(sess: Session):
     print(f"[{sess.sid}] TTS worker started. Waiting for first text chunk...")
+
+    # --- [측정용 변수 (유지)] ---
+    last_ready_time = None       
+    last_audio_duration = 0.0    
+    total_gap_time = 0.0         
+    total_gap_events = 0         
+    # --- [측정용 변수 끝] ---
 
     while not sess.stop_event.is_set():
         
@@ -125,12 +150,8 @@ def tts_worker(sess: Session):
         
         first_chunk = first_chunk_or_signal
 
-        # --- [필터 1] ---
-        # 큐에서 처음 꺼낸 텍스트(first_chunk)가 유효한 내용인지 검사
         if not HAS_CONTENT_REGEX.search(first_chunk):
             logging.info(f"[{sess.sid}] [FILTER] First chunk '{first_chunk.strip()}' has no content. Skipping this run.")
-            # 유효한 내용이 아니면(예: "!!! " 또는 "   ") 이번 추론 실행을 건너뛰고
-            # 다음 텍스트 조각을 기다립니다.
             continue
         
         logging.info(f"[{sess.sid}] First chunk received: '{first_chunk.strip()}'. Starting inference run.")
@@ -140,7 +161,6 @@ def tts_worker(sess: Session):
         def text_generator() -> Generator[str, None, None]:
             nonlocal text_for_this_run
             
-            # (위에서 이미 검증했으므로) 첫 번째 조각은 바로 yield
             logging.info(f"[{sess.sid}] Yielding first chunk: '{first_chunk.strip()}'")
             yield first_chunk
             
@@ -154,8 +174,6 @@ def tts_worker(sess: Session):
                         sess.keep_context = keep_context
                         
                         if marker is None:
-                            # --- [필터 2] ---
-                            # (EOS 신호 수신 시) 남아있는 버퍼가 유효한지 검사
                             if buffer and HAS_CONTENT_REGEX.search(buffer):
                                 logging.info(f"[{sess.sid}] [FILTER] EOS marker. Flushing valid buffer: '{buffer.strip()}'")
                                 text_for_this_run += buffer 
@@ -163,9 +181,9 @@ def tts_worker(sess: Session):
                             elif buffer:
                                 logging.info(f"[{sess.sid}] [FILTER] EOS marker. Discarding invalid buffer: '{buffer.strip()}'")
                             
-                            buffer = "" # 버퍼 비우기
+                            buffer = "" 
                             logging.info(f"[{sess.sid}] EOS marker received (Keep Context: {keep_context}). Terminating text generator.")
-                            break # text_generator 루프 종료
+                            break 
                     
                     else:
                         chunk = chunk_or_signal
@@ -176,20 +194,16 @@ def tts_worker(sess: Session):
                             to_yield = buffer[:last_space_index + 1]
                             buffer = buffer[last_space_index + 1:]
                             
-                            # --- [필터 3] ---
-                            # (공백 기준 분리 시) yield할 조각(to_yield)이 유효한지 검사
                             if HAS_CONTENT_REGEX.search(to_yield):
                                 text_for_this_run += to_yield
                                 logging.info(f"[{sess.sid}] [FILTER] Yielding valid chunk: '{to_yield.strip()}' | Remaining in buffer: '{buffer.strip()}'")
                                 yield to_yield
                             else:
-                                # (예: "Hello !!! ") 에서 "!!! " 부분이 여기에 해당
                                 logging.info(f"[{sess.sid}] [FILTER] Discarding invalid chunk: '{to_yield.strip()}' | Remaining in buffer: '{buffer.strip()}'")
                                 
                 except queue.Empty:
                     continue
             
-            # (루프가 비정상 종료 시) 마지막 버퍼 검사 (필터 2와 유사)
             if buffer and HAS_CONTENT_REGEX.search(buffer):
                 logging.warning(f"[{sess.sid}] [FILTER] Text generator exited loop. Final valid flush: '{buffer.strip()}'")
                 text_for_this_run += buffer 
@@ -199,7 +213,6 @@ def tts_worker(sess: Session):
             
             logging.info(f"[{sess.sid}] Text generator finished.")
 
-        # --- [이하 로직은 동일] ---
 
         use_frontend = True 
         logging.info(f"[{sess.sid}] Starting new TTS inference loop. Using Text Frontend: {use_frontend}")
@@ -232,7 +245,51 @@ def tts_worker(sess: Session):
             
         final_audio = torch.cat(all_chunks_for_this_run, dim=1)
         final_text = text_for_this_run.strip()
+
+        # --- [측정 로직 (CSV 저장 추가)] ---
+        current_ready_time = time.perf_counter()
+        current_audio_duration = final_audio.shape[1] / SAMPLE_RATE
         
+        logging.info(f"[{sess.sid}] [MEASURE] Batch Ready. Duration: {current_audio_duration:.4f}s. Text: '{final_text}'")
+
+        playback_gap = 0.0
+        time_between_batches = 0.0
+
+        if last_ready_time is not None:
+            time_between_batches = current_ready_time - last_ready_time
+            playback_gap = time_between_batches - last_audio_duration
+            
+            total_gap_time += playback_gap
+            total_gap_events += 1
+            
+            avg_gap = total_gap_time / total_gap_events
+            
+            logging.info(f"[{sess.sid}] [MEASURE] Time Since Last Batch: {time_between_batches:.4f}s")
+            logging.info(f"[{sess.sid}] [MEASURE] Last Audio Duration : {last_audio_duration:.4f}s")
+            logging.info(f"[{sess.sid}] [MEASURE] === Playback Gap (Delay): {playback_gap:.4f}s ===")
+            logging.info(f"[{sess.sid}] [MEASURE] === Average Gap So Far : {avg_gap:.4f}s ({total_gap_events} events) ===")
+
+            # --- CSV 파일에 저장 ---
+            try:
+                with MEASUREMENT_LOCK:
+                    # 'a' (append) 모드, 'utf-8-sig' (엑셀 한글 깨짐 방지)
+                    with open(MEASUREMENT_FILE, 'a', newline='', encoding='utf-8-sig') as f:
+                        writer = csv.writer(f)
+                        writer.writerow([
+                            time.strftime('%Y-%m-%d %H:%M:%S'), 
+                            total_gap_events, 
+                            f"{playback_gap:.4f}", 
+                            f"{current_audio_duration:.4f}",
+                            f"{time_between_batches:.4f}"
+                        ])
+            except IOError as e:
+                logging.error(f"CSV 쓰기 오류: {e}")
+            # --- [CSV 저장 끝] ---
+
+        last_ready_time = current_ready_time
+        last_audio_duration = current_audio_duration
+        # --- [측정 로직 끝] ---
+
         try:
             buf = io.BytesIO()
             torchaudio.save(buf, final_audio, SAMPLE_RATE, format="wav")
@@ -263,12 +320,11 @@ def tts_worker(sess: Session):
 # ==============================
 # 4) HTTP Routes
 # ==============================
-# (이하 /type, /sse_audio, app.run() 등 나머지 코드는 수정할 필요 없이 동일합니다.)
-# (app_stream_tts.py의 나머지 부분을 그대로 두시면 됩니다.)
+# (이하 코드는 수정 없음)
 
 @app.route('/outputs/<path:filename>')
 def serve_output_file(filename):
-    logging.info(f"Serving file: {filename} from {OUTPUT_DİR}")
+    logging.info(f"Serving file: {filename} from {OUTPUT_DIR}")
     return send_from_directory(OUTPUT_DIR, filename, as_attachment=False)
 
 @app.route("/")
@@ -297,9 +353,6 @@ def type_event():
             logging.info(f"[{sid}] Non-space text detected. Resetting space count.")
             sess.single_space_count = 0
 
-        # [참고] 여기서 1차 필터링을 할 수도 있지만, 
-        # tts_worker에서 처리하는 것이 더 견고합니다. (예: "Hello"와 "!!!"가 따로 들어오는 경우)
-        # 따라서 여기서는 필터링 없이 큐에 넣습니다.
         sess.text_stream_q.put(new_text_chunk)
         logging.info(f"[{sid}] Queued new text chunk: '{new_text_chunk.strip()}'")
         sess.last_sent_len = len(text)

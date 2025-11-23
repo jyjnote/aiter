@@ -434,56 +434,67 @@ class CosyVoice2Model(CosyVoiceModel):
         del self.llm.llm.model.model.layers
 
     def token2wav(self, token, prompt_token, prompt_feat, embedding, token_offset, uuid, stream=False, finalize=False, speed=1.0):
-        with torch.cuda.amp.autocast(self.fp16):
-            tts_mel, _ = self.flow.inference(token=token.to(self.device),
-                                             token_len=torch.tensor([token.shape[1]], dtype=torch.int32).to(self.device),
-                                             prompt_token=prompt_token.to(self.device),
-                                             prompt_token_len=torch.tensor([prompt_token.shape[1]], dtype=torch.int32).to(self.device),
-                                             prompt_feat=prompt_feat.to(self.device),
-                                             prompt_feat_len=torch.tensor([prompt_feat.shape[1]], dtype=torch.int32).to(self.device),
-                                             embedding=embedding.to(self.device),
-                                             streaming=stream,
-                                             finalize=finalize)
-        tts_mel = tts_mel[:, :, token_offset * self.flow.token_mel_ratio:]
-        
-        # 1. 캐시 읽기 (수정 필요 없음)
-        if self.hift_cache_dict[uuid] is not None:
-            hift_cache_mel, hift_cache_source = self.hift_cache_dict[uuid]['mel'], self.hift_cache_dict[uuid]['source']
-            tts_mel = torch.concat([hift_cache_mel, tts_mel], dim=2)
-        else:
-            hift_cache_source = torch.zeros(1, 1, 0)
+            with torch.cuda.amp.autocast(self.fp16):
+                tts_mel, _ = self.flow.inference(token=token.to(self.device),
+                                                token_len=torch.tensor([token.shape[1]], dtype=torch.int32).to(self.device),
+                                                prompt_token=prompt_token.to(self.device),
+                                                prompt_token_len=torch.tensor([prompt_token.shape[1]], dtype=torch.int32).to(self.device),
+                                                prompt_feat=prompt_feat.to(self.device),
+                                                prompt_feat_len=torch.tensor([prompt_feat.shape[1]], dtype=torch.int32).to(self.device),
+                                                embedding=embedding.to(self.device),
+                                                streaming=stream,
+                                                finalize=finalize)
+            tts_mel = tts_mel[:, :, token_offset * self.flow.token_mel_ratio:]
             
-        # 2. 캐시 쓰기 또는 파이널라이즈
-        if finalize is False:
-            # [컨텍스트 유지]
-            # (누적 공백 2회 시 이 블록이 실행됨)
-            # 오디오 생성
-            tts_speech, tts_source = self.hift.inference(speech_feat=tts_mel, cache_source=hift_cache_source)
+            # 1. 캐시 읽기 (수정 필요 없음)
             if self.hift_cache_dict[uuid] is not None:
-                # 이전 캐시와 이어붙임
-                tts_speech = fade_in_out(tts_speech, self.hift_cache_dict[uuid]['speech'], self.speech_window)
-            
-            # [중요] 다음 배치를 위해 캐시 업데이트
-            self.hift_cache_dict[uuid] = {'mel': tts_mel[:, :, -self.mel_cache_len:],
-                                          'source': tts_source[:, :, -self.source_cache_len:],
-                                          'speech': tts_speech[:, -self.source_cache_len:]}
-            # 캐시 부분을 제외하고 반환
-            tts_speech = tts_speech[:, :-self.source_cache_len]
-        else:
-            # [컨텍스트 종료]
-            # (구두점 입력 시 이 블록이 실행됨)
-            if speed != 1.0:
-                assert self.hift_cache_dict[uuid] is None, 'speed change only support non-stream inference mode'
-                tts_mel = F.interpolate(tts_mel, size=int(tts_mel.shape[2] / speed), mode='linear')
-            
-            # 오디오 생성
-            tts_speech, tts_source = self.hift.inference(speech_feat=tts_mel, cache_source=hift_cache_source)
-            if self.hift_cache_dict[uuid] is not None:
-                # 이전 캐시와 이어붙임
-                tts_speech = fade_in_out(tts_speech, self.hift_cache_dict[uuid]['speech'], self.speech_window)
-            
-            # [중요] 캐시를 업데이트하지 않고 전체 오디오 반환
-        return tts_speech
+                hift_cache_mel, hift_cache_source = self.hift_cache_dict[uuid]['mel'], self.hift_cache_dict[uuid]['source']
+                tts_mel = torch.concat([hift_cache_mel, tts_mel], dim=2)
+            else:
+                hift_cache_source = torch.zeros(1, 1, 0)
+                
+            # 2. 캐시 쓰기 또는 파이널라이즈 [수정됨]
+            if finalize is False:
+                # [컨텍스트 유지]
+                # [수정] "이상한 발음"(잘림 현상)을 유발하는 캐시 및 잘라내기 로직을 비활성화합니다.
+                # [수정] finalize=True일 때와 동일하게, 캐시를 저장하지 않고 전체 오디오를 반환합니다.
+                
+                # --- 아래 10줄을 주석 처리(비활성화)합니다 ---
+                # tts_speech, tts_source = self.hift.inference(speech_feat=tts_mel, cache_source=hift_cache_source)
+                # if self.hift_cache_dict[uuid] is not None:
+                #     # 이전 캐시와 이어붙임
+                #     tts_speech = fade_in_out(tts_speech, self.hift_cache_dict[uuid]['speech'], self.speech_window)
+                
+                # # [중요] 다음 배치를 위해 캐시 업데이트
+                # self.hift_cache_dict[uuid] = {'mel': tts_mel[:, :, -self.mel_cache_len:],
+                #                               'source': tts_source[:, :, -self.source_cache_len:],
+                #                               'speech': tts_speech[:, -self.source_cache_len:]}
+                # # 캐시 부분을 제외하고 반환
+                # tts_speech = tts_speech[:, :-self.source_cache_len]
+                # --- 주석 처리 끝 ---
+
+                # [수정] finalize=True 로직을 대신 실행 (speed != 1.0 부분은 제외)
+                tts_speech, tts_source = self.hift.inference(speech_feat=tts_mel, cache_source=hift_cache_source)
+                if self.hift_cache_dict[uuid] is not None:
+                    # 이전 캐시와 이어붙임
+                    tts_speech = fade_in_out(tts_speech, self.hift_cache_dict[uuid]['speech'], self.speech_window)
+                # [수정] 캐시를 저장하지 않고, 오디오를 자르지 않고 전체 반환
+                
+            else:
+                # [컨텍스트 종료]
+                # (구두점 입력 시 이 블록이 실행됨 - 기존과 동일)
+                if speed != 1.0:
+                    assert self.hift_cache_dict[uuid] is None, 'speed change only support non-stream inference mode'
+                    tts_mel = F.interpolate(tts_mel, size=int(tts_mel.shape[2] / speed), mode='linear')
+                
+                # 오디오 생성
+                tts_speech, tts_source = self.hift.inference(speech_feat=tts_mel, cache_source=hift_cache_source)
+                if self.hift_cache_dict[uuid] is not None:
+                    # 이전 캐시와 이어붙임
+                    tts_speech = fade_in_out(tts_speech, self.hift_cache_dict[uuid]['speech'], self.speech_window)
+                
+                # [중요] 캐시를 업데이트하지 않고 전체 오디오 반환
+            return tts_speech
 
     def tts(self, text=torch.zeros(1, 0, dtype=torch.int32), flow_embedding=torch.zeros(0, 192), llm_embedding=torch.zeros(0, 192),
                 prompt_text=torch.zeros(1, 0, dtype=torch.int32),
