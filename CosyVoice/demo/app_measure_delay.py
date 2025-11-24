@@ -71,12 +71,10 @@ MEASUREMENT_LOCK = threading.Lock()
 # CSV 파일 헤더 초기화
 try:
     with MEASUREMENT_LOCK:
-        with open(MEASUREMENT_FILE, 'w', newline='', encoding='utf-8-sig') as f: #<-- [수정] 엑셀 한글 깨짐 방지용 'utf-8-sig'
+        with open(MEASUREMENT_FILE, 'w', newline='', encoding='utf-8-sig') as f:
             writer = csv.writer(f)
-            # --- [핵심 수정] ---
-            # 컬럼명을 한글로 변경
-            writer.writerow(['측정 시간', '배치 순서', '재생 딜레이(초)', '오디오 길이(초)', '배치 간 시간(초)'])
-            # --- [수정 끝] ---
+            # [수정] '생성 시간(초)' 및 'RTF' 컬럼 추가
+            writer.writerow(['측정 시간', '배치 순서', '재생 딜레이(초)', '오디오 길이(초)', '배치 간 시간(초)', '생성 시간(초)', 'RTF'])
     logging.info(f"측정 로그 파일이 {MEASUREMENT_FILE} (으)로 초기화되었습니다.")
 except IOError as e:
     logging.error(f"CSV 파일 쓰기 실패: {e}")
@@ -111,7 +109,7 @@ def get_or_create_session(sid: str) -> Session:
     return sess
 
 # ==============================
-# 3) TTS Worker & Synthesizer [CSV 저장 로직]
+# 3) TTS Worker & Synthesizer [RTF 측정 추가]
 # ==============================
 
 HAS_CONTENT_REGEX = re.compile(r'[a-zA-Z0-9가-힣]')
@@ -119,15 +117,12 @@ HAS_CONTENT_REGEX = re.compile(r'[a-zA-Z0-9가-힣]')
 def tts_worker(sess: Session):
     print(f"[{sess.sid}] TTS worker started. Waiting for first text chunk...")
 
-    # --- [측정용 변수 (유지)] ---
     last_ready_time = None       
     last_audio_duration = 0.0    
     total_gap_time = 0.0         
     total_gap_events = 0         
-    # --- [측정용 변수 끝] ---
 
     while not sess.stop_event.is_set():
-        
         try:
             first_chunk_or_signal: Any = sess.text_stream_q.get(timeout=1.0) 
         except queue.Empty:
@@ -136,88 +131,57 @@ def tts_worker(sess: Session):
         if isinstance(first_chunk_or_signal, tuple):
             marker, keep_context = first_chunk_or_signal
             sess.keep_context = keep_context
-            
             if marker is None:
                 if not keep_context:
-                    logging.info(f"[{sess.sid}] Got EOS Signal (Keep Context: False). Sending 'end'.")
                     sess.sse_q.put(json.dumps({"type": "end"}))
-                else:
-                    logging.info(f"[{sess.sid}] Got EOS Signal (Keep Context: True). Not sending 'end' message.")
-                continue
-            else:
-                logging.warning(f"[{sess.sid}] Received unexpected tuple: {first_chunk_or_signal}")
                 continue
         
         first_chunk = first_chunk_or_signal
 
         if not HAS_CONTENT_REGEX.search(first_chunk):
-            logging.info(f"[{sess.sid}] [FILTER] First chunk '{first_chunk.strip()}' has no content. Skipping this run.")
             continue
         
-        logging.info(f"[{sess.sid}] First chunk received: '{first_chunk.strip()}'. Starting inference run.")
+        logging.info(f"[{sess.sid}] Starting inference run for: '{first_chunk.strip()}'")
         text_for_this_run = first_chunk 
         sess.accumulated_audio.clear()
 
         def text_generator() -> Generator[str, None, None]:
             nonlocal text_for_this_run
-            
-            logging.info(f"[{sess.sid}] Yielding first chunk: '{first_chunk.strip()}'")
             yield first_chunk
-            
             buffer = "" 
             while not sess.stop_event.is_set():
                 try:
                     chunk_or_signal = sess.text_stream_q.get(timeout=0.1) 
-                    
                     if isinstance(chunk_or_signal, tuple):
                         marker, keep_context = chunk_or_signal
                         sess.keep_context = keep_context
-                        
                         if marker is None:
                             if buffer and HAS_CONTENT_REGEX.search(buffer):
-                                logging.info(f"[{sess.sid}] [FILTER] EOS marker. Flushing valid buffer: '{buffer.strip()}'")
                                 text_for_this_run += buffer 
                                 yield buffer
-                            elif buffer:
-                                logging.info(f"[{sess.sid}] [FILTER] EOS marker. Discarding invalid buffer: '{buffer.strip()}'")
-                            
-                            buffer = "" 
-                            logging.info(f"[{sess.sid}] EOS marker received (Keep Context: {keep_context}). Terminating text generator.")
                             break 
-                    
                     else:
                         chunk = chunk_or_signal
                         buffer += chunk
-                        
                         last_space_index = buffer.rfind(' ')
                         if last_space_index != -1:
                             to_yield = buffer[:last_space_index + 1]
                             buffer = buffer[last_space_index + 1:]
-                            
                             if HAS_CONTENT_REGEX.search(to_yield):
                                 text_for_this_run += to_yield
-                                logging.info(f"[{sess.sid}] [FILTER] Yielding valid chunk: '{to_yield.strip()}' | Remaining in buffer: '{buffer.strip()}'")
                                 yield to_yield
-                            else:
-                                logging.info(f"[{sess.sid}] [FILTER] Discarding invalid chunk: '{to_yield.strip()}' | Remaining in buffer: '{buffer.strip()}'")
-                                
                 except queue.Empty:
                     continue
-            
             if buffer and HAS_CONTENT_REGEX.search(buffer):
-                logging.warning(f"[{sess.sid}] [FILTER] Text generator exited loop. Final valid flush: '{buffer.strip()}'")
                 text_for_this_run += buffer 
                 yield buffer
-            elif buffer:
-                logging.warning(f"[{sess.sid}] [FILTER] Text generator exited loop. Discarding invalid buffer: '{buffer.strip()}'")
-            
-            logging.info(f"[{sess.sid}] Text generator finished.")
-
 
         use_frontend = True 
-        logging.info(f"[{sess.sid}] Starting new TTS inference loop. Using Text Frontend: {use_frontend}")
-        
         all_chunks_for_this_run = []
+        
+        # --- [RTF 측정 시작] ---
+        inference_start_time = time.perf_counter()
+        
         try:
             for out in cosyvoice.inference_instruct2(
                     tts_text=text_generator(), 
@@ -235,22 +199,26 @@ def tts_worker(sess: Session):
                     all_chunks_for_this_run.append(audio_chunk)
 
         except Exception as e:
-            logging.error(f"[{sess.sid}] TTS (instruct2) Error: {e}", exc_info=True)
-            sess.sse_q.put(json.dumps({"type": "log", "msg": f"TTS error: {e}"}))
+            logging.error(f"[{sess.sid}] TTS error: {e}")
             continue
 
+        # --- [RTF 측정 종료] ---
+        inference_end_time = time.perf_counter()
+        inference_duration = inference_end_time - inference_start_time
+
         if not all_chunks_for_this_run:
-            logging.warning(f"[{sess.sid}] No audio was generated for this run.")
             continue
             
         final_audio = torch.cat(all_chunks_for_this_run, dim=1)
         final_text = text_for_this_run.strip()
 
-        # --- [측정 로직 (CSV 저장 추가)] ---
+        # --- [측정 로직 (RTF 포함)] ---
         current_ready_time = time.perf_counter()
         current_audio_duration = final_audio.shape[1] / SAMPLE_RATE
         
-        logging.info(f"[{sess.sid}] [MEASURE] Batch Ready. Duration: {current_audio_duration:.4f}s. Text: '{final_text}'")
+        # RTF 계산: (생성에 걸린 시간) / (생성된 오디오 길이)
+        # 낮을수록 빠름 (0.5 means generating 10s audio took 5s)
+        current_rtf = inference_duration / current_audio_duration if current_audio_duration > 0 else 0.0
 
         playback_gap = 0.0
         time_between_batches = 0.0
@@ -262,17 +230,10 @@ def tts_worker(sess: Session):
             total_gap_time += playback_gap
             total_gap_events += 1
             
-            avg_gap = total_gap_time / total_gap_events
-            
-            logging.info(f"[{sess.sid}] [MEASURE] Time Since Last Batch: {time_between_batches:.4f}s")
-            logging.info(f"[{sess.sid}] [MEASURE] Last Audio Duration : {last_audio_duration:.4f}s")
-            logging.info(f"[{sess.sid}] [MEASURE] === Playback Gap (Delay): {playback_gap:.4f}s ===")
-            logging.info(f"[{sess.sid}] [MEASURE] === Average Gap So Far : {avg_gap:.4f}s ({total_gap_events} events) ===")
+            logging.info(f"[{sess.sid}] [MEASURE] Gap: {playback_gap:.4f}s | RTF: {current_rtf:.4f}")
 
-            # --- CSV 파일에 저장 ---
             try:
                 with MEASUREMENT_LOCK:
-                    # 'a' (append) 모드, 'utf-8-sig' (엑셀 한글 깨짐 방지)
                     with open(MEASUREMENT_FILE, 'a', newline='', encoding='utf-8-sig') as f:
                         writer = csv.writer(f)
                         writer.writerow([
@@ -280,11 +241,12 @@ def tts_worker(sess: Session):
                             total_gap_events, 
                             f"{playback_gap:.4f}", 
                             f"{current_audio_duration:.4f}",
-                            f"{time_between_batches:.4f}"
+                            f"{time_between_batches:.4f}",
+                            f"{inference_duration:.4f}", # 생성 시간
+                            f"{current_rtf:.4f}"         # RTF
                         ])
             except IOError as e:
                 logging.error(f"CSV 쓰기 오류: {e}")
-            # --- [CSV 저장 끝] ---
 
         last_ready_time = current_ready_time
         last_audio_duration = current_audio_duration
@@ -293,38 +255,26 @@ def tts_worker(sess: Session):
         try:
             buf = io.BytesIO()
             torchaudio.save(buf, final_audio, SAMPLE_RATE, format="wav")
-            buf.seek(0)
-            wav_chunk_bytes = buf.read()
-            b64 = base64.b64encode(wav_chunk_bytes).decode("utf-8")
+            b64 = base64.b64encode(buf.read()).decode("utf-8")
             
+            msg_type = "streaming_audio" if sess.keep_context else "final_audio"
+            msg = {"type": msg_type, "b64wav": b64}
             if not sess.keep_context:
-                logging.info(f"[{sess.sid}] This was a FINAL batch (keep_context=False). Sending 'final_audio' with Base64.")
-                sess.sse_q.put(json.dumps({
-                    "type": "final_audio",
-                    "b64wav": b64,
-                    "text": final_text
-                }))
+                msg["text"] = final_text
             
-            else:
-                logging.info(f"[{sess.sid}] This was an INTERIM batch (keep_context=True). Sending 'streaming_audio'.")
-                sess.sse_q.put(json.dumps({"type": "streaming_audio", "b64wav": b64}))
+            sess.sse_q.put(json.dumps(msg))
 
         except Exception as e:
-             logging.error(f"[{sess.sid}] ❌ Failed to encode/send audio as Base64: {e}")
+             logging.error(f"Encoding error: {e}")
         
-        logging.info(f"[{sess.sid}] Inference run finished. Waiting for next text chunk...")
-    
     print(f"[{sess.sid}] TTS worker fully stopped.")
 
 
 # ==============================
 # 4) HTTP Routes
 # ==============================
-# (이하 코드는 수정 없음)
-
 @app.route('/outputs/<path:filename>')
 def serve_output_file(filename):
-    logging.info(f"Serving file: {filename} from {OUTPUT_DIR}")
     return send_from_directory(OUTPUT_DIR, filename, as_attachment=False)
 
 @app.route("/")
@@ -340,33 +290,24 @@ def type_event():
 
     sess = get_or_create_session(sid)
     
-    new_text_chunk = None
-    force_from_server = False
-    
     if len(text) > sess.last_sent_len:
         new_text_chunk = text[sess.last_sent_len:]
-        
         if new_text_chunk.endswith(' ') and not new_text_chunk.endswith('  '):
             sess.single_space_count += 1
-            logging.info(f"[{sid}] Single space detected. Count: {sess.single_space_count}")
         elif not new_text_chunk.strip() == "":
-            logging.info(f"[{sid}] Non-space text detected. Resetting space count.")
             sess.single_space_count = 0
 
         sess.text_stream_q.put(new_text_chunk)
-        logging.info(f"[{sid}] Queued new text chunk: '{new_text_chunk.strip()}'")
         sess.last_sent_len = len(text)
     
+    force_from_server = False
     if sess.single_space_count >= 2:
-        logging.info(f"[{sid}] TRIGGER HIT (2 cumulative spaces). Setting server_force=true.")
         force_from_server = True
         sess.single_space_count = 0
 
     if force_from_client:
-        logging.info(f"[{sid}] Force flush (Client). Queueing EOS (Keep Context: False).")
         sess.text_stream_q.put((None, False))
     elif force_from_server:
-        logging.info(f"[{sid}] Force flush (Server). Queueing EOS (Keep Context: True).")
         sess.text_stream_q.put((None, True))
 
     return jsonify({"ok": True})
@@ -381,21 +322,15 @@ def sse_audio():
             try:
                 msg = sess.sse_q.get(timeout=0.5)
                 yield f"data: {msg}\n\n"
-                if '"type":"end"' in msg:
-                    logging.info(f"[{sid}] SSE 'end' marker sent to client.")
             except queue.Empty:
                 yield 'data: {"type":"ping"}\n\n'
 
-    headers = {
+    return Response(event_stream(), headers={
         "Cache-Control": "no-cache",
         "X-Accel-Buffering": "no",
         "Content-Type": "text/event-stream",
         "Connection": "keep-alive",
-    }
-    return Response(event_stream(), headers=headers)
+    })
 
-# ==============================
-# 5) Run
-# ==============================
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000, debug=False, threaded=True)

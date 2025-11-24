@@ -433,6 +433,38 @@ class CosyVoice2Model(CosyVoiceModel):
         self.llm.lock = threading.Lock()
         del self.llm.llm.model.model.layers
 
+    # =========================================================================
+    # [수정됨] 뒷부분 무음 제거 (Simple Trimmer)
+    # =========================================================================
+    def _trim_trailing_silence(self, audio, buffer_sec=0.05):
+        """
+        소리가 끝난 지점을 찾아, 그 뒤로 buffer_sec(0.2초) 만큼만 남기고 잘라냅니다.
+        """
+        if audio.numel() == 0:
+            return audio
+
+        # 1. 아주 미세한 노이즈(0.0001)보다 큰 소리가 있는 곳을 찾음
+        # (완전한 0이 아닌 디지털 노이즈를 걸러내기 위함)
+        threshold = 1e-4
+        non_silent_indices = torch.nonzero(audio.abs() > threshold)
+
+        # 2. 전체가 무음이면 빈 텐서 반환
+        if non_silent_indices.numel() == 0:
+            return torch.zeros(1, 0).to(audio.device)
+
+        # 3. 소리가 나는 "가장 마지막 지점" 찾기
+        # non_silent_indices[-1]은 마지막 좌표, 그 중 [-1]은 시간축 인덱스
+        last_sound_index = non_silent_indices[-1, -1].item()
+
+        # 4. 그 지점에서 정확히 buffer_sec 만큼만 더하고 자르기
+        sr = 22050
+        cutoff_index = last_sound_index + int(sr * buffer_sec)
+        
+        # 오디오 전체 길이보다 길어지지 않게 방지 (IndexError 방지)
+        cutoff_index = min(audio.shape[1], cutoff_index)
+
+        return audio[:, :cutoff_index]
+
     def token2wav(self, token, prompt_token, prompt_feat, embedding, token_offset, uuid, stream=False, finalize=False, speed=1.0):
             with torch.cuda.amp.autocast(self.fp16):
                 tts_mel, _ = self.flow.inference(token=token.to(self.device),
@@ -446,43 +478,29 @@ class CosyVoice2Model(CosyVoiceModel):
                                                 finalize=finalize)
             tts_mel = tts_mel[:, :, token_offset * self.flow.token_mel_ratio:]
             
-            # 1. 캐시 읽기 (수정 필요 없음)
+            # 1. 캐시 읽기
             if self.hift_cache_dict[uuid] is not None:
                 hift_cache_mel, hift_cache_source = self.hift_cache_dict[uuid]['mel'], self.hift_cache_dict[uuid]['source']
                 tts_mel = torch.concat([hift_cache_mel, tts_mel], dim=2)
             else:
                 hift_cache_source = torch.zeros(1, 1, 0)
                 
-            # 2. 캐시 쓰기 또는 파이널라이즈 [수정됨]
+            # 2. 캐시 쓰기 또는 파이널라이즈
             if finalize is False:
-                # [컨텍스트 유지]
-                # [수정] "이상한 발음"(잘림 현상)을 유발하는 캐시 및 잘라내기 로직을 비활성화합니다.
-                # [수정] finalize=True일 때와 동일하게, 캐시를 저장하지 않고 전체 오디오를 반환합니다.
+                # [컨텍스트 유지 모드]
+                # 사용자 요청에 따라 finalize=False여도 오디오를 자르거나 캐시를 업데이트하지 않고
+                # 전체 오디오를 생성하여 반환함 (끝부분 잘림 방지 후 trim_trailing_silence에서 처리)
                 
-                # --- 아래 10줄을 주석 처리(비활성화)합니다 ---
-                # tts_speech, tts_source = self.hift.inference(speech_feat=tts_mel, cache_source=hift_cache_source)
-                # if self.hift_cache_dict[uuid] is not None:
-                #     # 이전 캐시와 이어붙임
-                #     tts_speech = fade_in_out(tts_speech, self.hift_cache_dict[uuid]['speech'], self.speech_window)
-                
-                # # [중요] 다음 배치를 위해 캐시 업데이트
-                # self.hift_cache_dict[uuid] = {'mel': tts_mel[:, :, -self.mel_cache_len:],
-                #                               'source': tts_source[:, :, -self.source_cache_len:],
-                #                               'speech': tts_speech[:, -self.source_cache_len:]}
-                # # 캐시 부분을 제외하고 반환
-                # tts_speech = tts_speech[:, :-self.source_cache_len]
-                # --- 주석 처리 끝 ---
-
-                # [수정] finalize=True 로직을 대신 실행 (speed != 1.0 부분은 제외)
                 tts_speech, tts_source = self.hift.inference(speech_feat=tts_mel, cache_source=hift_cache_source)
                 if self.hift_cache_dict[uuid] is not None:
                     # 이전 캐시와 이어붙임
                     tts_speech = fade_in_out(tts_speech, self.hift_cache_dict[uuid]['speech'], self.speech_window)
-                # [수정] 캐시를 저장하지 않고, 오디오를 자르지 않고 전체 반환
+                
+                # [중요] 캐시 업데이트 로직 비활성화 (매번 전체 오디오 반환 위함)
+                # self.hift_cache_dict[uuid] = ... 
                 
             else:
-                # [컨텍스트 종료]
-                # (구두점 입력 시 이 블록이 실행됨 - 기존과 동일)
+                # [컨텍스트 종료 모드]
                 if speed != 1.0:
                     assert self.hift_cache_dict[uuid] is None, 'speed change only support non-stream inference mode'
                     tts_mel = F.interpolate(tts_mel, size=int(tts_mel.shape[2] / speed), mode='linear')
@@ -493,7 +511,6 @@ class CosyVoice2Model(CosyVoiceModel):
                     # 이전 캐시와 이어붙임
                     tts_speech = fade_in_out(tts_speech, self.hift_cache_dict[uuid]['speech'], self.speech_window)
                 
-                # [중요] 캐시를 업데이트하지 않고 전체 오디오 반환
             return tts_speech
 
     def tts(self, text=torch.zeros(1, 0, dtype=torch.int32), flow_embedding=torch.zeros(0, 192), llm_embedding=torch.zeros(0, 192),
@@ -502,7 +519,7 @@ class CosyVoice2Model(CosyVoiceModel):
                 flow_prompt_speech_token=torch.zeros(1, 0, dtype=torch.int32),
                 prompt_speech_feat=torch.zeros(1, 0, 80), source_speech_token=torch.zeros(1, 0, dtype=torch.int32), 
                 stream=False, speed=1.0, 
-                session_id=None, keep_context=True, # <--- [핵심] 파라미터 추가
+                session_id=None, keep_context=True, 
                 **kwargs):
             
             # 1. 세션 ID 설정
@@ -515,19 +532,15 @@ class CosyVoice2Model(CosyVoiceModel):
 
             # 2. 캐시 및 스레드 초기화
             with self.lock:
-                # [수정] 세션이 존재하지 않을 때만 캐시를 초기화
                 if this_uuid not in self.tts_speech_token_dict:
                     logging.info(f"[{this_uuid}] New session. Initializing caches.")
                     self.tts_speech_token_dict[this_uuid] = []
                     self.llm_end_dict[this_uuid] = False
                     self.hift_cache_dict[this_uuid] = None
                 else:
-                    # 세션이 존재하면 (즉, 이전 배치가 있었으면)
-                    # 토큰 딕셔너리와 종료 플래그만 초기화
                     logging.info(f"[{this_uuid}] Existing session. Re-using hift_cache. Resetting tokens.")
                     self.tts_speech_token_dict[this_uuid] = []
                     self.llm_end_dict[this_uuid] = False
-                    # self.hift_cache_dict[this_uuid]는 의도적으로 보존
 
             if source_speech_token.shape[1] == 0:
                 p = threading.Thread(target=self.llm_job, args=(text, prompt_text, llm_prompt_speech_token, llm_embedding, this_uuid))
@@ -535,20 +548,16 @@ class CosyVoice2Model(CosyVoiceModel):
                 p = threading.Thread(target=self.vc_job, args=(source_speech_token, this_uuid))
             p.start()
             
-            
-            # 3. "일괄 처리" 대기 (기존과 동일)
-            # LLM 스레드가 (None, keep_context) 신호를 받을 때까지 대기
+            # 3. LLM 작업 대기
             p.join() 
 
             logging.info(f"[{this_uuid}] LLM job finished. Consuming all accumulated tokens.")
 
-            # 4. 누적된 모든 토큰 가져오기 (기존과 동일)
+            # 4. 누적된 모든 토큰 가져오기
             with self.lock:
                 all_tokens = self.tts_speech_token_dict[this_uuid]
             
-            # 5. [수정] 'finalize' 여부 결정
-            # keep_context=True (누적 공백 2회) -> is_final_batch=False (캐시 유지, 오디오 끝부분 자름)
-            # keep_context=False (구두점) -> is_final_batch=True (캐시 삭제, 오디오 전체 생성)
+            # 5. 'finalize' 여부 결정
             is_final_batch = not keep_context
             
             logging.info(f"[{this_uuid}] Batch type: {'FINAL' if is_final_batch else 'INTERIM (keeping context)'}")
@@ -561,31 +570,37 @@ class CosyVoice2Model(CosyVoiceModel):
                 logging.info(f"[{this_uuid}] Processing all {len(all_tokens)} tokens (finalize={is_final_batch}).")
                 this_tts_speech_token = torch.tensor(all_tokens).unsqueeze(dim=0)
                 
-                # [수정] token2wav 호출
                 this_tts_speech = self.token2wav(token=this_tts_speech_token,
                                                 prompt_token=flow_prompt_speech_token,
                                                 prompt_feat=prompt_speech_feat,
                                                 embedding=flow_embedding,
                                                 token_offset=0,
                                                 uuid=this_uuid,
-                                                stream=True, # <--- [중요] 캐시를 읽고 쓰려면 True여야 함
-                                                finalize=is_final_batch, # <--- [중요] 동적으로 설정
+                                                stream=True, 
+                                                finalize=is_final_batch,
                                                 speed=speed)
+
+            # =========================================================================
+            # [적용] 뒷부분 무음 강제 자르기 (Simple Logic)
+            # =========================================================================
+            # 원본 오디오가 존재할 때만 수행
+            if this_tts_speech.shape[1] > 0:
+                # 소리가 끝난 후 0.2초만 남기고 뒷부분은 무조건 삭제
+                this_tts_speech = self._trim_trailing_silence(this_tts_speech, buffer_sec=0.2)
 
             # 7. 최종 오디오 반환
             yield {'tts_speech': this_tts_speech.cpu()}
             
-            # 8. [수정] 세션 정리
+            # 8. 세션 정리
             with self.lock:
                 self.tts_speech_token_dict.pop(this_uuid, None)
                 self.llm_end_dict.pop(this_uuid, None)
                 
                 if is_final_batch:
                     logging.info(f"[{this_uuid}] Final batch. Popping hift_cache.")
-                    self.hift_cache_dict.pop(this_uuid, None) # 캐시 삭제
+                    self.hift_cache_dict.pop(this_uuid, None) 
                 else:
                     logging.info(f"[{this_uuid}] Interim batch. Preserving hift_cache for next run.")
-                    # 캐시를 보존
             
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()

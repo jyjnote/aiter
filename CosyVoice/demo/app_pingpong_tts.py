@@ -132,7 +132,7 @@ def tts_worker(sess: Session, text_queue: queue.Queue, worker_id: str):
                     instruct_text="",
                     prompt_speech_16k=prompt_speech_16k,
                     zero_shot_spk_id="",
-                    stream=True,
+                    stream=False,
                     speed=1.0,
                     text_frontend=True,
                     session_id=worker_session_id, 

@@ -304,7 +304,7 @@ def type_event():
         logging.info(f"[{sid}] Queued new text chunk: '{new_text_chunk.strip()}'")
         sess.last_sent_len = len(text)
     
-    if sess.single_space_count >= 2:
+    if sess.single_space_count >= 4:
         logging.info(f"[{sid}] TRIGGER HIT (2 cumulative spaces). Setting server_force=true.")
         force_from_server = True
         sess.single_space_count = 0

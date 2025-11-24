@@ -2,7 +2,7 @@
 <html lang="ko">
 <head>
   <meta charset="utf-8" />
-  <title>Streaming TTS (Hybrid + Perf Log)</title>
+  <title>Streaming TTS (Buffered Strategy)</title>
   
   <style>
     body {
@@ -133,8 +133,8 @@
 <body>
 
   <div class="container">
-    <h1>Streaming TTS (No-Save Strategy + Perf Log)</h1>
-    <p>실시간으로 음성이 재생되며, 문장 끝에서 플레이어가 생성됩니다.</p>
+    <h1>Streaming TTS (Buffered: 3 Chunks)</h1>
+    <p>오디오 버퍼가 3개 쌓이면 재생을 시작합니다. (끊김 방지)</p>
     
     <textarea id="ta" placeholder="여기에 문장을 입력하세요."></textarea>
     
@@ -175,10 +175,10 @@
 
   const audioContext = new (window.AudioContext || window.webkitAudioContext)();
   let streamingDuration = 0; 
+  let lastPlaybackEndTime = null;
 
-  // [PERF] 타이머 변수 추가
-  let lastPlaybackEndTime = null; // 오디오 재생이 끝난 시간
-  // [수정] lastChunkArrivalTime 변수 제거
+  // [수정] 버퍼링 기준 설정
+  const BUFFER_THRESHOLD = 1; 
 
   function addLog(message) {
     console.log(message);
@@ -188,7 +188,6 @@
   const q = [];
   let playing = false;
   
-  // Base64 데이터를 받아 Blob URL로 변환하고 재생 큐에 추가하는 함수
   function b64ToBlobUrl(b64) {
     try {
       const byteChars = atob(b64);
@@ -203,16 +202,30 @@
     }
   }
 
-  function playStreamingChunk(b64) {
+  // [수정] isFinal 파라미터 추가
+  function playStreamingChunk(b64, isFinal = false) {
     if (!audioContext) return;
     
     const url = b64ToBlobUrl(b64);
-    if (!url) return; // 디코딩 실패
+    if (!url) return; 
     
     q.push(url);
-    if (!playing) playNext();
 
-    // 가짜 프로그레스 바 업데이트 로직 (선택 사항)
+    // [수정] 버퍼링 로직 적용
+    if (!playing) {
+      // 1. 큐에 BUFFER_THRESHOLD(3개) 이상 쌓였거나
+      // 2. 이번이 마지막 청크(isFinal)라면 재생 시작
+      if (q.length >= BUFFER_THRESHOLD || isFinal) {
+         addLog(`[BUFFER] 재생 시작 조건 충족 (큐: ${q.length}개, 마지막: ${isFinal})`);
+         playNext();
+      } else {
+         addLog(`[BUFFER] 버퍼링 중... (${q.length}/${BUFFER_THRESHOLD})`);
+      }
+    } else {
+      // 이미 재생 중이라면 큐에 추가만 함 (자연스럽게 이어서 재생됨)
+      // addLog(`[BUFFER] 재생 중 큐 추가. (현재 큐 대기: ${q.length})`);
+    }
+
     try {
       const byteChars = atob(b64);
       const byteNums = new Array(byteChars.length);
@@ -229,15 +242,18 @@
   }
 
   function playNext() {
-    if (q.length === 0) { playing = false; return; }
+    if (q.length === 0) { 
+        playing = false; 
+        addLog("[AUDIO] 큐 비어있음. 재생 대기.");
+        return; 
+    }
     playing = true;
 
-    // [PERF] 오디오 재생 간격(Gap) 측정 (이 로그는 유지)
     if (lastPlaybackEndTime) {
       const startTime = new Date().getTime();
       const gap = (startTime - lastPlaybackEndTime) / 1000;
-      addLog(`[PERF] 🏁 이전 오디오 종료 후 다음 재생까지 공백: ${gap.toFixed(3)}초`);
-      lastPlaybackEndTime = null; // 다음 측정을 위해 리셋
+      addLog(`[PERF] 🏁 공백(Gap): ${gap.toFixed(3)}초`);
+      lastPlaybackEndTime = null; 
     }
 
     const url = q.shift();
@@ -253,15 +269,11 @@
     if (oldUrl.startsWith('blob:')) {
       URL.revokeObjectURL(oldUrl);
     }
-    
-    // [PERF] 재생 종료 시간 기록
     lastPlaybackEndTime = new Date().getTime();
-    addLog(`[AUDIO] 재생 완료. (남은 큐: ${q.length})`);
-
+    // addLog(`[AUDIO] 재생 완료. (남은 큐: ${q.length})`);
     playNext();
   };
 
-  // 'final_audio' 메시지를 처리하는 함수 (Base64 사용)
   function displayFinalAudio(msg) {
     fakePlayerContainer.style.display = 'none';
     streamingDuration = 0;
@@ -282,30 +294,25 @@
 
     const audioElement = document.createElement('audio');
     audioElement.controls = true;
+    audioElement.setAttribute("controlsList", "nodownload");
     audioElement.preload = 'auto';
     audioElement.autoplay = false; 
 
     if (msg.b64wav) {
-        addLog(`[AUDIO] 최종 오디오 Base64 수신. Blob URL 생성 중...`);
+        addLog(`[AUDIO] 최종 오디오 수신. 플레이어 생성.`);
         const url = b64ToBlobUrl(msg.b64wav);
         if (url) {
             audioElement.src = url;
             audioElement.onended = () => {
-                if (audioElement.src.startsWith('blob:')) {
-                    URL.revokeObjectURL(audioElement.src);
-                    addLog(`[AUDIO] Blob URL 해제: ${audioElement.src}`);
-                }
+                if (audioElement.src.startsWith('blob:')) URL.revokeObjectURL(audioElement.src);
             };
-        } else {
-             textElement.textContent += " (오디오 로딩 실패)";
         }
     } else {
-        addLog(`[AUDIO] 오류: 'final_audio' 메시지에 'b64wav' 필드가 없습니다.`);
+        addLog(`[AUDIO] 오류: 'final_audio' 메시지에 'b64wav' 없음.`);
     }
 
     newSentenceDiv.appendChild(textElement);
     newSentenceDiv.appendChild(audioElement);
-
     resultsContainer.prepend(newSentenceDiv);
   }
 
@@ -318,26 +325,31 @@
     try {
       const msg = JSON.parse(e.data);
       
-      // [PERF] 청크 도착 간격 측정 (제거됨)
-      
       if (msg.type === 'streaming_audio' && msg.b64wav) {
-        addLog(`[AUDIO] 스트리밍 청크 수신. 즉시 재생합니다.`);
+        // [수정] 일반 스트리밍 청크는 isFinal = false
         fakePlayerContainer.style.display = 'block';
-        playStreamingChunk(msg.b64wav);
+        playStreamingChunk(msg.b64wav, false);
       
       } else if (msg.type === 'final_audio' && msg.b64wav) {
-        addLog(`[AUDIO] 최종 오디오 수신: ${msg.text}. 즉시 재생합니다.`);
-        playStreamingChunk(msg.b64wav); // 스트리밍 플레이어로 즉시 재생
-        displayFinalAudio(msg); // 동시에 하단 기록에도 추가
+        // [수정] 최종 오디오는 isFinal = true (즉시 재생 트리거)
+        addLog(`[AUDIO] Final chunk 수신.`);
+        playStreamingChunk(msg.b64wav, true); 
+        displayFinalAudio(msg); 
       
       } else if (msg.type === 'log') {
         addLog(`[SERVER LOG] ${msg.msg}`);
       
       } else if (msg.type === 'end') {
-        addLog("🏁 TTS 문장 작업 완료.");
+        addLog("🏁 TTS 문장 종료 신호 수신.");
         fakePlayerContainer.style.display = 'none';
         streamingDuration = 0;
-      // [수정] lastChunkArrivalTime = null; 제거
+        
+        // [수정] 문장이 끝났는데 아직 재생 안 된 버퍼(3개 미만이라 대기중인 것들)가 있다면 강제로 재생 시작
+        if (!playing && q.length > 0) {
+            addLog(`[BUFFER] 남은 버퍼(${q.length}개) 강제 재생.`);
+            playNext();
+        }
+
       } else if (msg.type === 'stream_text') {
         addLog(`[TEXT] 스트리밍 텍스트: ${msg.text}`);
         fakePlayerText.textContent = `"${msg.text}"`;
@@ -355,45 +367,29 @@
 
   function sendText(force=false) {
     const text = ta.value;
-    
     if (force && !text) { 
-        addLog("텍스트 없이 문장 전송(.) 시도. 무시함.");
         return;
     }
-
     fetch('/type', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({ sid, text, force })
     }).catch((err) => addLog(`[API] /type 호출 실패: ${err}`));
-    
-    if (force) {
-      ta.value = ''; // 전송 후 텍스트 영역 비우기
-      q.length = 0; // 재생 큐 비우기
-    }
   }
 
   let isComposing = false;
   const punctuationRegex = /[.,?!]$/; 
   const hasContentRegex = /[a-zA-Z0-9가-힣]/;
 
-  ta.addEventListener('compositionstart', () => {
-    addLog("[INPUT] 한글 조합 시작...");
-    isComposing = true;
-  });
+  ta.addEventListener('compositionstart', () => { isComposing = true; });
 
   ta.addEventListener('compositionend', (e) => {
     isComposing = false;
-    addLog("[INPUT] 한글 조합 완료.");
     handleInput(e);
   });
 
   function handleInput(e) {
-    addLog(`[INPUT] 이벤트 발생 (Type: ${e.type}) | 조합 중: ${isComposing}`);
-    
-    if (isComposing) {
-      return; 
-    }
+    if (isComposing) return; 
     
     const currentText = ta.value;
     if (!currentText) return;
@@ -402,17 +398,10 @@
     const prevChar = currentText.slice(-2, -1);
 
     if (punctuationRegex.test(currentText)) {
-      if (!hasContentRegex.test(currentText)) {
-          addLog("▶▶▶ 구두점만 입력: 전송 무시. 텍스트 영역을 비웁니다.");
-          ta.value = '';
-          return;
-      } else {
-          addLog("▶▶▶ 구두점 입력: 문장 전송 (force=true)");
-          sendText(true);
-      }
+        addLog("▶▶▶ 구두점 입력: 즉시 합성 요청 (force=true) | 텍스트 유지");
+        sendText(true); 
     } else if (lastChar === ' ') {
       if (prevChar === ' ' || currentText.trim() === '') {
-           addLog("▶ 연속된 공백 또는 공백만 입력: 전송 무시");
            return;
       } else {
           addLog("▶ 스페이스바 입력: 단어 전송 (force=false)");
